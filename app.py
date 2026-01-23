@@ -10,6 +10,26 @@ from tagger import guess_tags
 from ab_rank import build_priors, rank_candidates, tag_key
 from rating import tweet_score, update_abs_rating, update_rel_rating
 from csvio import read_csv, append_csv
+# app.py 冒頭付近
+import os
+
+# Secrets を最優先
+gemini_key = (
+    st.secrets.get("GEMINI_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
+    or ""
+)
+
+with st.sidebar:
+    st.subheader("Gemini 3 設定（無料最適化）")
+    use_gemini = st.toggle("Geminiを使う", value=True)
+
+    # 表示用（入力しなくてOK）
+    if not gemini_key:
+        gemini_key = st.text_input(
+            "GEMINI_API_KEY（未設定時のみ）",
+            type="password"
+        )
 
 CSV_PATH = "twitter_log.csv"
 
@@ -41,7 +61,14 @@ priors = build_priors(rows) if rows else {}
 with st.sidebar:
     st.subheader("Gemini 3 設定（無料最適化）")
     use_gemini = st.toggle("Geminiを使う", value=True)
-    gemini_key = st.text_input("GEMINI_API_KEY", type="password")
+
+# 1) まず Secrets から読む（Cloud用）
+    secret_key = st.secrets.get("GEMINI_API_KEY", "")
+
+# 2) 必要ならUIで上書きできる（ローカル用/テスト用）
+    override = st.text_input("GEMINI_API_KEY（未設定ならSecretsを使う）", type="password")
+
+    gemini_key = override.strip() or secret_key
     model = st.selectbox("モデル", ["gemini-3-flash", "gemini-3-pro"], index=0)
     per_role_n = st.slider("各役割の候補数", 3, 8, 5, 1)
 
@@ -64,7 +91,7 @@ with tab1:
 
     if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
         if use_gemini and not gemini_key:
-            st.error("Geminiを使う場合は GEMINI_API_KEY を入力してください。")
+            st.error("Geminiを使う場合は GEMINI_API_KEY を設定してください（Secrets推奨）")
             st.stop()
 
         pack = generate_daily_pack(
