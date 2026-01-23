@@ -21,17 +21,8 @@ gemini_key = (
 )
 
 with st.sidebar:
-    st.subheader("Gemini 3 設定（無料最適化）")
-    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini_1")
-
-    # 表示用（入力しなくてOK）
-    if not gemini_key:
-        gemini_key = st.text_input(
-            "GEMINI_API_KEY（未設定時のみ）",
-            type="password"
-        )
-
-CSV_PATH = "twitter_log.csv"
+    
+ CSV_PATH = "twitter_log.csv"
 
 st.set_page_config(page_title="Twitter 将棋AI式 自動化（1日3ツイート）", layout="wide")
 st.title("Twitter 将棋AI式 自動化（完成版）— 1日3ツイート固定（本命/準本命/実験）")
@@ -60,15 +51,16 @@ priors = build_priors(rows) if rows else {}
 
 with st.sidebar:
     st.subheader("Gemini 3 設定（無料最適化）")
-    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini_2")
+    use_gemini = st.toggle("Geminiを使う", value=True, key="use_gemini")
 
-# 1) まず Secrets から読む（Cloud用）
+    # 1) まず Secrets から読む（Cloud用）
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# 2) 必要ならUIで上書きできる（ローカル用/テスト用）
-    override = st.text_input("GEMINI_API_KEY（未設定ならSecretsを使う）", type="password")
+    # 2) 必要ならUIで上書き（テスト用）
+    override = st.text_input("GEMINI_API_KEY（任意：上書き）", type="password", key="gemini_key_input")
 
     gemini_key = override.strip() or secret_key
+
     model = st.selectbox("モデル", ["gemini-3-flash", "gemini-3-pro"], index=0)
     per_role_n = st.slider("各役割の候補数", 3, 8, 5, 1)
 
