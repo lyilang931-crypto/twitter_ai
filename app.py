@@ -22,7 +22,7 @@ gemini_key = (
 
 with st.sidebar:
     st.subheader("Gemini 3 設定（無料最適化）")
-    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini")
+    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini_1")
 
     # 表示用（入力しなくてOK）
     if not gemini_key:
@@ -60,7 +60,7 @@ priors = build_priors(rows) if rows else {}
 
 with st.sidebar:
     st.subheader("Gemini 3 設定（無料最適化）")
-    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini")
+    use_gemini = st.toggle("Geminiを使う", value=True,key="use_gemini"_2)
 
 # 1) まず Secrets から読む（Cloud用）
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
