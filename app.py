@@ -95,7 +95,7 @@ with st.sidebar:
         else:
             st.warning("⚠️ API Key が未設定です（Secrets推奨）")
 
-    model = st.selectbox("モデル", ["gemini-3-flash", "gemini-3-pro"], index=0)
+    model = st.selectbox("モデル", ["gemini-2.5-flash", "gemini-2.5-flash-lite"], index=0)
     per_role_n = st.slider("各役割の候補数", 3, 8, 5, 1)
 
     st.subheader("仮想自己対局")

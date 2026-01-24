@@ -4,7 +4,7 @@ import google.generativeai as genai
 def gemini_generate(
     prompt: str,
     api_key: str | None = None,
-    model: str = "gemini-3-flash",
+    model: str = "gemini-2.5-flash",
     max_output_tokens: int = 320,
     temperature: float = 0.6,
 ) -> str:
