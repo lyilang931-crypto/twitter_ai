@@ -1,5 +1,6 @@
 import json
 from datetime import date
+import os
 
 import pandas as pd
 import streamlit as st
@@ -10,23 +11,40 @@ from tagger import guess_tags
 from ab_rank import build_priors, rank_candidates, tag_key
 from rating import tweet_score, update_abs_rating, update_rel_rating
 from csvio import read_csv, append_csv
-# app.py 冒頭付近
-import os
 
-# Secrets を最優先
-gemini_key = (
-    st.secrets.get("Gemini_API_KEY")
-    or os.getenv("Gemini_API_KEY")
-    or ""
-)
 
-with st.sidebar:
-    
- CSV_PATH = "twitter_log.csv"
-
+# =========================
+# Streamlit 基本設定（最上部）
+# =========================
 st.set_page_config(page_title="Twitter 将棋AI式 自動化（1日3ツイート）", layout="wide")
 st.title("Twitter 将棋AI式 自動化（完成版）— 1日3ツイート固定（本命/準本命/実験）")
 
+CSV_PATH = "twitter_log.csv"
+
+
+# =========================
+# Secrets / Env 読み込み（安全版）
+# =========================
+def load_secret_key() -> str:
+    # Streamlit Cloud: st.secrets
+    try:
+        v = st.secrets.get("GEMINI_API_KEY", "")
+        if v:
+            return str(v).strip()
+        v = st.secrets.get("Gemini_API_KEY", "")
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+
+    # Local: 環境変数
+    v = os.getenv("GEMINI_API_KEY", "") or os.getenv("Gemini_API_KEY", "")
+    return str(v).strip()
+
+
+# =========================
+# CSV 読み込み & 事前計算
+# =========================
 rows = read_csv(CSV_PATH)
 
 def last_float(col: str, default: float) -> float:
@@ -46,20 +64,36 @@ for r in rows:
         scores.append(float(r.get("tweet_score", 0.0) or 0.0))
     except Exception:
         pass
-global_mean = (sum(scores)/len(scores)) if scores else 0.02
+
+global_mean = (sum(scores) / len(scores)) if scores else 0.02
 priors = build_priors(rows) if rows else {}
 
+
+# =========================
+# Sidebar UI
+# =========================
 with st.sidebar:
-    st.subheader("Gemini 3 設定（無料最適化）")
+    st.subheader("Gemini 設定（Secrets優先）")
+
     use_gemini = st.toggle("Geminiを使う", value=True, key="use_gemini")
 
-    # 1) まず Secrets から読む（Cloud用）
-    secret_key = st.secrets.get("Gemini_API_KEY", "")
+    secret_key = load_secret_key()
 
-    # 2) 必要ならUIで上書き（テスト用）
-    override = st.text_input("Gemini_API_KEY（任意：上書き）", type="password", key="gemini_key_input")
+    # 任意：手入力で上書き（Secretsあるなら空欄でOK）
+    override = st.text_input(
+        "Gemini API Key（任意：上書き）",
+        type="password",
+        key="gemini_key_input",
+        help="通常は空欄でOK（Secretsまたは環境変数を使います）",
+    )
 
     gemini_key = override.strip() or secret_key
+
+    if use_gemini:
+        if gemini_key:
+            st.caption("✅ API Key 検出済み（Secrets/Env/手入力のいずれか）")
+        else:
+            st.warning("⚠️ API Key が未設定です（Secrets推奨）")
 
     model = st.selectbox("モデル", ["gemini-3-flash", "gemini-3-pro"], index=0)
     per_role_n = st.slider("各役割の候補数", 3, 8, 5, 1)
@@ -72,7 +106,12 @@ with st.sidebar:
     k_abs = st.number_input("K（絶対）", value=16.0, step=1.0)
     k_rel = st.number_input("K（相対）", value=16.0, step=1.0)
 
+
+# =========================
+# Tabs
+# =========================
 tab1, tab2, tab3 = st.tabs(["① 今日の3ツイ生成→承認", "② 実測入力（棋譜）", "③ 分析（勝ち構造）"])
+
 
 # =========================================================
 # ① 今日の3ツイ生成→承認
@@ -83,16 +122,21 @@ with tab1:
 
     if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
         if use_gemini and not gemini_key:
-            st.error("Geminiを使う場合は Gemini_API_KEY を設定してください（Secrets推奨）")
+            st.error("Geminiを使う場合は Gemini API Key を設定してください（Secrets推奨）")
             st.stop()
 
-        pack = generate_daily_pack(
-            api_key=gemini_key,
-            topic=topic,
-            per_role_n=int(per_role_n),
-            use_gemini=bool(use_gemini),
-            model=model
-        )
+        try:
+            pack = generate_daily_pack(
+                api_key=gemini_key,
+                topic=topic,
+                per_role_n=int(per_role_n),
+                use_gemini=bool(use_gemini),
+                model=model,
+            )
+        except Exception as e:
+            st.error("生成でエラーが出ました。APIキー/モデル/課金設定/制限を確認してください。")
+            st.code(str(e))
+            st.stop()
 
         # 役割ごとにランキングを作る
         ranked_pack = []
@@ -100,15 +144,18 @@ with tab1:
             candidates = []
             for t in block["candidates"]:
                 tags = guess_tags(t)
-                candidates.append({
-                    "text": t,
-                    "tags": tags,
-                    "role": block["role"],
-                    "role_label": block["role_label"],
-                    "time_slot": block["time_slot"],
-                    "time_slot_label": block["time_slot_label"],
-                    "intent_hint": block["intent"],
-                })
+                candidates.append(
+                    {
+                        "text": t,
+                        "tags": tags,
+                        "role": block["role"],
+                        "role_label": block["role_label"],
+                        "time_slot": block["time_slot"],
+                        "time_slot_label": block["time_slot_label"],
+                        "intent_hint": block["intent"],
+                    }
+                )
+
             ranked = rank_candidates(candidates, priors, global_mean=global_mean, alpha=float(alpha))
             ranked_pack.append({"meta": block, "ranked": ranked})
 
@@ -119,17 +166,20 @@ with tab1:
 
     if ranked_pack:
         st.caption("各役割で“勝ちやすい順”に並びます。各役割から1本ずつ承認してください。")
+
         for group in ranked_pack:
             meta = group["meta"]
             ranked = group["ranked"]
 
             st.markdown(f"### {meta['role_label']} / {meta['time_slot_label']}（狙い：{meta['intent']}）")
+
             for i, c in enumerate(ranked, start=1):
                 with st.expander(f"#{i} 期待Score {c['expected_score']:.3f} | {c['text'][:26]}..."):
                     st.write(c["text"])
                     st.json(c["tags"])
                     st.code("（投稿用）\n" + c["text"])
-                    if st.button(f"この案を承認（{meta['role']})", key=f"approve_{meta['role']}_{i}"):
+
+                    if st.button(f"この案を承認（{meta['role']}）", key=f"approve_{meta['role']}_{i}"):
                         st.session_state["approved"][meta["role"]] = {
                             "role": meta["role"],
                             "role_label": meta["role_label"],
@@ -144,13 +194,14 @@ with tab1:
         approved = st.session_state.get("approved", {})
         if approved:
             st.markdown("## 承認済み（今日の3ツイ）")
-            for role in ["MAIN","SUB","EXP"]:
+            for role in ["MAIN", "SUB", "EXP"]:
                 if role in approved:
                     a = approved[role]
                     st.markdown(f"**{a['role_label']} / {a['time_slot_label']}**")
                     st.code(a["text"])
                 else:
                     st.warning(f"{role} が未承認です（3つ揃えると最強）")
+
 
 # =========================================================
 # ② 実測入力（棋譜）
@@ -159,7 +210,7 @@ with tab2:
     st.subheader("実測を入力して棋譜に保存（1ツイ＝1対局）")
 
     approved = st.session_state.get("approved", {})
-    role_pick = st.selectbox("入力するツイート（役割）", ["MAIN","SUB","EXP"], index=0)
+    role_pick = st.selectbox("入力するツイート（役割）", ["MAIN", "SUB", "EXP"], index=0)
 
     default_text = approved.get(role_pick, {}).get("text", "")
     default_tags = approved.get(role_pick, {}).get("tags", None)
@@ -168,7 +219,11 @@ with tab2:
 
     st.caption("※できれば『承認したツイ』を選んで入力。手入力でもOK。")
 
-    time_slot = st.selectbox("時間帯", ["AM","NOON","PM"], index=["AM","NOON","PM"].index(default_slot) if default_slot in ["AM","NOON","PM"] else 0)
+    time_slot = st.selectbox(
+        "時間帯",
+        ["AM", "NOON", "PM"],
+        index=["AM", "NOON", "PM"].index(default_slot) if default_slot in ["AM", "NOON", "PM"] else 0,
+    )
     st.write(f"時間帯メモ：{ {'AM':'朝(7-9)','NOON':'昼(12-13)','PM':'夜(20-22)'}[time_slot] }")
 
     text = st.text_area("投稿文（コピペ）", value=default_text, height=120)
@@ -233,6 +288,7 @@ with tab2:
         st.info(f"TweetScore: {s:.3f} | 絶対: {abs_before:.1f}→{abs_after:.1f} | 相対: {rel_before:.1f}→{rel_after:.1f}")
         st.rerun()
 
+
 # =========================================================
 # ③ 分析（勝ち構造）
 # =========================================================
@@ -255,7 +311,17 @@ with tab3:
 
         st.subheader("最近の棋譜（30行）")
         df = pd.DataFrame(rows)
-        for c in ["tweet_score","abs_rating_after","rel_rating_after","impressions","likes","rts","replies","followers_after","followers_before"]:
+        for c in [
+            "tweet_score",
+            "abs_rating_after",
+            "rel_rating_after",
+            "impressions",
+            "likes",
+            "rts",
+            "replies",
+            "followers_after",
+            "followers_before",
+        ]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         st.dataframe(df.tail(30), use_container_width=True)

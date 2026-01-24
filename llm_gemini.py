@@ -13,7 +13,13 @@ def gemini_generate(
         raise RuntimeError("GEMINI_API_KEY is not set")
 
     genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model)
+
+    # ★ ここが重要
+    model_name = model
+    if not model.startswith("models/"):
+        model_name = f"models/{model}"
+
+    m = genai.GenerativeModel(model_name)
 
     resp = m.generate_content(
         prompt,
@@ -22,4 +28,5 @@ def gemini_generate(
             "max_output_tokens": max_output_tokens,
         },
     )
+
     return (resp.text or "").strip()
