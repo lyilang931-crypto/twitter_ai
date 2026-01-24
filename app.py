@@ -15,8 +15,8 @@ import os
 
 # Secrets を最優先
 gemini_key = (
-    st.secrets.get("GEMINI_API_KEY")
-    or os.getenv("GEMINI_API_KEY")
+    st.secrets.get("Gemini_API_KEY")
+    or os.getenv("Gemini_API_KEY")
     or ""
 )
 
@@ -54,10 +54,10 @@ with st.sidebar:
     use_gemini = st.toggle("Geminiを使う", value=True, key="use_gemini")
 
     # 1) まず Secrets から読む（Cloud用）
-    secret_key = st.secrets.get("GEMINI_API_KEY", "")
+    secret_key = st.secrets.get("Gemini_API_KEY", "")
 
     # 2) 必要ならUIで上書き（テスト用）
-    override = st.text_input("GEMINI_API_KEY（任意：上書き）", type="password", key="gemini_key_input")
+    override = st.text_input("Gemini_API_KEY（任意：上書き）", type="password", key="gemini_key_input")
 
     gemini_key = override.strip() or secret_key
 
@@ -83,7 +83,7 @@ with tab1:
 
     if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
         if use_gemini and not gemini_key:
-            st.error("Geminiを使う場合は GEMINI_API_KEY を設定してください（Secrets推奨）")
+            st.error("Geminiを使う場合は Gemini_API_KEY を設定してください（Secrets推奨）")
             st.stop()
 
         pack = generate_daily_pack(
