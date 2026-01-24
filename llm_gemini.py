@@ -1,39 +1,45 @@
 # llm_gemini.py
 import os
-import time
-import random
-import google.generativeai as genai
+from typing import Optional
+from google import genai
+
+DEFAULT_MODEL = "gemini-flash-latest"
+
+def _load_key(api_key: Optional[str] = None) -> str:
+    k = api_key or os.getenv("GEMINI_API_KEY", "")
+    k = str(k).strip()
+    if not k:
+        raise RuntimeError("GEMINI_API_KEY is not set (Secrets or env).")
+    return k
 
 def gemini_generate(
     prompt: str,
-    api_key: str | None = None,
-    model: str = "gemini-2.5-flash",
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_MODEL,
     max_output_tokens: int = 1400,
     temperature: float = 0.7,
-    retries: int = 4,
 ) -> str:
-    api_key = (api_key or os.getenv("Gemini_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("Gemini_API_KEY is not set")
+    key = _load_key(api_key)
+    client = genai.Client(api_key=key)
 
-    genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model)
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        },
+    )
+    text = getattr(resp, "text", "") or ""
+    return text.strip()
 
-    last_err = None
-    for i in range(retries + 1):
-        try:
-            resp = m.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
-            )
-            return (resp.text or "").strip()
-        except Exception as e:
-            last_err = e
-            # Rate limit / transient 用の雑リトライ（指数バックオフ）
-            if i < retries:
-                time.sleep((2 ** i) + random.random())
-                continue
-            raise last_err
+def list_models(api_key: Optional[str] = None) -> list[str]:
+    key = _load_key(api_key)
+    client = genai.Client(api_key=key)
+    ms = client.models.list()
+    out = []
+    for m in ms:
+        name = getattr(m, "name", "")
+        if name:
+            out.append(name)
+    return out

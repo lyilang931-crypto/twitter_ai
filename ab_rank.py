@@ -1,44 +1,61 @@
+# ab_rank.py
 import json
 from collections import defaultdict
-from typing import List, Dict, Any
-
-KEYS = ["intent","hook_type","sentence_len","has_question","cta"]
+from typing import Dict, Any, List
 
 def tag_key(tags: Dict[str, Any]) -> str:
-    compact = {k: tags.get(k) for k in KEYS}
-    return json.dumps(compact, ensure_ascii=False, sort_keys=True)
+    # 重要タグだけキー化
+    keys = ["intent", "hook_type", "sentence_len", "has_question", "cta"]
+    parts = []
+    for k in keys:
+        parts.append(f"{k}={tags.get(k)}")
+    return "|".join(parts)
 
-def build_priors(rows: List[Dict[str, Any]]):
+def build_priors(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """
+    tags_keyごとに平均スコアを学習（軽量な事前分布）
+    """
     sums = defaultdict(float)
     cnts = defaultdict(int)
+
     for r in rows:
-        tj = r.get("tags_key","") or r.get("tags_json","") or ""
-        if not tj:
+        k = r.get("tags_key", "") or ""
+        if not k:
             continue
         try:
             s = float(r.get("tweet_score", 0.0) or 0.0)
         except Exception:
             s = 0.0
-        sums[tj] += s
-        cnts[tj] += 1
-    priors = {}
-    for k in cnts:
-        priors[k] = {"count": cnts[k], "mean": sums[k]/cnts[k]}
-    return priors
+        sums[k] += s
+        cnts[k] += 1
 
-def expected_score(tags: Dict[str, Any], priors, global_mean: float, alpha: float = 5.0) -> float:
-    k = tag_key(tags)
-    if k not in priors:
-        return global_mean
-    c = priors[k]["count"]
-    m = priors[k]["mean"]
-    # スムージング（データ少の暴れ防止）
-    return (m * c + global_mean * alpha) / (c + alpha)
+    pri = {}
+    for k in sums:
+        pri[k] = {"mean": sums[k] / max(1, cnts[k]), "n": float(cnts[k])}
+    return pri
 
-def rank_candidates(candidates: List[Dict[str, Any]], priors, global_mean: float, alpha: float = 5.0):
+def rank_candidates(
+    candidates: List[Dict[str, Any]],
+    priors: Dict[str, Dict[str, float]],
+    global_mean: float = 0.02,
+    alpha: float = 5.0,
+) -> List[Dict[str, Any]]:
+    """
+    expected = (alpha*global_mean + n*prior_mean)/(alpha+n)
+    """
     ranked = []
     for c in candidates:
-        exp = expected_score(c["tags"], priors, global_mean, alpha=alpha)
-        ranked.append({**c, "expected_score": exp, "tags_key": tag_key(c["tags"])})
+        k = tag_key(c.get("tags", {}))
+        prior = priors.get(k)
+        if prior:
+            n = prior["n"]
+            m = prior["mean"]
+            exp = (alpha * global_mean + n * m) / (alpha + n)
+        else:
+            exp = global_mean
+        out = dict(c)
+        out["expected_score"] = float(exp)
+        ranked.append(out)
+
     ranked.sort(key=lambda x: x["expected_score"], reverse=True)
     return ranked
