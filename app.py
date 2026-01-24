@@ -21,13 +21,13 @@ CSV_PATH = "twitter_log.csv"
 def load_gemini_key() -> str:
     # Streamlit Cloud: st.secrets
     try:
-        v = st.secrets.get("GEMINI_API_KEY", "")
+        v = st.secrets.get("Gemini_API_KEY", "")
         if v:
             return str(v).strip()
     except Exception:
         pass
     # Local: env
-    return str(os.getenv("GEMINI_API_KEY", "")).strip()
+    return str(os.getenv("Gemini_API_KEY", "")).strip()
 
 # =========================
 # Streamlit settings
@@ -64,11 +64,11 @@ with st.sidebar:
     st.subheader("Gemini 設定（固定）")
     gemini_key = load_gemini_key()
     if gemini_key:
-        st.success("✅ GEMINI_API_KEY 検出済み（Secrets/Env）")
+        st.success("✅ Gemini_API_KEY 検出済み（Secrets/Env）")
     else:
-        st.error("❌ GEMINI_API_KEY が未設定です（Secrets/Envに設定してください）")
+        st.error("❌ Gemini_API_KEY が未設定です（Secrets/Envに設定してください）")
 
-    st.caption("モデルは最新 Gemini-3-flash 固定")
+    st.caption("モデルは最新 Gemini-flash-latest 固定")
     model = "gemini-flash-latest"
 
     st.subheader("トレンド（任意）")
@@ -98,7 +98,7 @@ with tab1:
 
     if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
         if not gemini_key:
-            st.error("GEMINI_API_KEY が未設定です（Secrets/Env）。")
+            st.error("Gemini_API_KEY が未設定です（Secrets/Env）。")
             st.stop()
 
         try:

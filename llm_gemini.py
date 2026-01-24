@@ -6,10 +6,10 @@ from google import genai
 DEFAULT_MODEL = "gemini-flash-latest"
 
 def _load_key(api_key: Optional[str] = None) -> str:
-    k = api_key or os.getenv("GEMINI_API_KEY", "")
+    k = api_key or os.getenv("Gemini_API_KEY", "")
     k = str(k).strip()
     if not k:
-        raise RuntimeError("GEMINI_API_KEY is not set (Secrets or env).")
+        raise RuntimeError("Gemini_API_KEY is not set (Secrets or env).")
     return k
 
 def gemini_generate(
