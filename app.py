@@ -96,20 +96,31 @@ with tab1:
     st.subheader("今日のテーマ（経済・起業向け）")
     topic = st.text_input("テーマ", value="起業で失敗する人の共通点（経済視点）")
 
-if "last_gen_time" not in st.session_state:
-    st.session_state["last_gen_time"] = 0
+    import time  # すでに上でimportしてるなら不要
 
-now = time.time()
-if now - st.session_state["last_gen_time"] < 60:
-    st.warning("⏳ レート制限回避のため、60秒ほど待ってください")
-    st.stop()
+    # ---- クールダウン（ボタンは消さない）----
+    COOLDOWN_SEC = 60
+    if "last_gen_time" not in st.session_state:
+        st.session_state["last_gen_time"] = 0.0
 
-    if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
+    elapsed = time.time() - float(st.session_state["last_gen_time"])
+    remain = max(0, int(COOLDOWN_SEC - elapsed))
+    disabled = remain > 0
+
+    if disabled:
+        st.info(f"⏳ レート制限回避のため、あと {remain} 秒待ってください（連打防止）")
+
+    clicked = st.button("今日の3ツイ候補を生成 → 仮想自己対局", disabled=disabled)
+
+    if clicked:
+        # 連打防止：押した瞬間にタイムスタンプ更新
         st.session_state["last_gen_time"] = time.time()
+
         if not gemini_key:
             st.error("Gemini_API_KEY が未設定です（Secrets/Env）。")
             st.stop()
 
+        # ↓この下に、pack = generate_daily_pack(...) 以降の生成処理が続く
         try:
             pack = generate_daily_pack(
                 api_key=gemini_key,
