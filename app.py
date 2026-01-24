@@ -2,7 +2,7 @@
 import json
 from datetime import date
 import os
-
+import time
 import pandas as pd
 import streamlit as st
 
@@ -96,7 +96,16 @@ with tab1:
     st.subheader("今日のテーマ（経済・起業向け）")
     topic = st.text_input("テーマ", value="起業で失敗する人の共通点（経済視点）")
 
+if "last_gen_time" not in st.session_state:
+    st.session_state["last_gen_time"] = 0
+
+now = time.time()
+if now - st.session_state["last_gen_time"] < 60:
+    st.warning("⏳ レート制限回避のため、60秒ほど待ってください")
+    st.stop()
+
     if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
+        st.session_state["last_gen_time"] = time.time()
         if not gemini_key:
             st.error("Gemini_API_KEY が未設定です（Secrets/Env）。")
             st.stop()
