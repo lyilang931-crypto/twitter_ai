@@ -12,29 +12,24 @@ SAFETY_CORE = (
     "政治/宗教/差別/誹謗中傷/個人攻撃/過激煽り。"
 )
 
-def build_prompt_all(topic: str, trend_hint: str, n_each: int) -> str:
-    """
-    1回のAPIで MAIN/SUB/EXP をまとめて生成するプロンプト。
-    出力は必ずJSONのみ:
-      {"MAIN":[...], "SUB":[...], "EXP":[...]}
-    """
+def build_prompt(topic: str, trend_hint: str, n: int, role: str) -> str:
+    # TPM250を守るため短い。出力はJSON限定。
+    # role別に“尖り方”を変える
+    if role == "MAIN":
+        intent = "否定×断定。刺さる結論→理由を一息で。"
+    elif role == "SUB":
+        intent = "否定×数字/比較。具体。"
+    else:
+        intent = "質問×逆説。分散狙い(上振れ)。"
+
     trend = f"トレンド: {trend_hint}" if trend_hint else "トレンド: なし"
 
     return (
         f"X投稿作成。テーマ:{topic} / {trend}\n"
         f"{STYLE_CORE}\n{SAFETY_CORE}\n"
-        "制約:\n"
-        "・1文=1ツイ\n"
-        "・改行なし\n"
-        "・140字以内\n"
-        "・短すぎ禁止(目安60字以上。ただし意図的短文はOK)\n"
-        "役割:\n"
-        "MAIN: 否定×断定。刺さる結論→理由を一息で。\n"
-        "SUB: 否定×数字/比較。具体。\n"
-        "EXP: 質問×逆説。分散狙い(上振れ)。\n"
-        "出力ルール:\n"
-        "・JSONのみ返す(説明禁止/コードブロック禁止)\n"
-        "・必ず有効なJSONとして閉じる\n"
-        f'{{"MAIN":["..."],"SUB":["..."],"EXP":["..."]}}\n'
-        f"各配列は{int(n_each)}件。\n"
+        f"制約: 1文=1ツイ。改行なし。140字以内。短すぎ禁止(目安60字以上,ただし意図的短文OK)。\n"
+        f"狙い({role}): {intent}\n"
+        f"JSONのみ返す。説明禁止。schema厳守:\n"
+        f'{{"{role}":[ "...", "...", "..."]}}\n'
+        f"{role}は{n}件。必ずJSONを閉じる。"
     )
