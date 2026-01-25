@@ -146,17 +146,11 @@ def local_expand(seeds: list[str], target_n: int) -> list[str]:
 def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
     prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
 
-    # TPM250目安（入力が長いなら短縮）
-    if rough_token_count(prompt) > LIMITS.tpm:
-        prompt = prompt[:420]
+    # ここは wait_for_rpm じゃない
+    rl.wait(rough_token_count(prompt))
 
-    rl.wait(input_tokens=rough_token_count(prompt))
+    data = gemini_json(prompt, api_key=api_key, model=model)
 
-    data = gemini_json(
-        prompt,
-        api_key=api_key,
-        model=model,
-    )
     arr = data.get(role, [])
     return [postprocess_tweet(str(x)) for x in arr]
 
