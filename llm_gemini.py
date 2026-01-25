@@ -1,104 +1,64 @@
 # llm_gemini.py
 from __future__ import annotations
 
-import time, json, re
-from typing import Any, Dict
+import json
+import re
+import time
 import traceback
+from typing import Any, Dict
 
 import google.generativeai as genai
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-def gemini_json(
-    prompt: str,
-    api_key: str,
-    model: str,
-    max_output_tokens: int = 1400,
-    temperature: float = 0.7,
-    retries: int = 2,
-    sleep_sec: float = 2.2,
-) -> Dict[str, Any]:
-    last_err = None
-
-    for i in range(int(retries) + 1):
-        try:
-            genai.configure(api_key=api_key)
-            m = genai.GenerativeModel(model)
-
-            resp = m.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": float(temperature),
-                    "max_output_tokens": int(max_output_tokens),
-                },
-            )
-
-            raw = (getattr(resp, "text", None) or "").strip()
-
-            m2 = _JSON_RE.search(raw)
-            if not m2:
-                raise ValueError(f"JSON not found. raw={raw[:200]}...")
-
-            return json.loads(m2.group(0))
-
-        except Exception as e:
-            last_err = e
-            print("=== Gemini error ===")
-            traceback.print_exc()   # ← これが本命（Logsに完全表示）
-            if i < int(retries):
-                time.sleep(float(sleep_sec))
-
-    raise RuntimeError(f"Gemini failed: {last_err}")
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 def _extract_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     m = _JSON_RE.search(raw)
     if not m:
-        raise ValueError(f"JSON not found:\n{raw}")
-
+        raise ValueError(f"JSON not found. raw={raw[:300]}")
     s = m.group(0)
-
-    # 軽い修復（よくある崩れ）
-    s = s.replace("\u201c", '"').replace("\u201d", '"')
-    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    # よくある崩れを軽く補正
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
     s = re.sub(r",\s*}", "}", s)
     s = re.sub(r",\s*]", "]", s)
-
     return json.loads(s)
 
-def gemini_json(
-    prompt: str,
-    api_key: str,
-    model: str = "gemini-flash-latest",
-    max_output_tokens: int = 1200,
-    temperature: float = 0.7,
-    retries: int = 3,
-    base_sleep: float = 1.0,
-) -> Dict[str, Any]:
+def gemini_json(prompt: str, api_key: str, model: str, retries: int = 3, sleep_sec: float = 2.0) -> Dict[str, Any]:
     genai.configure(api_key=api_key)
     m = genai.GenerativeModel(model)
 
-    last_err = None
-    for i in range(retries + 1):
+    last_err: Exception | None = None
+
+    for i in range(retries):
         try:
             resp = m.generate_content(
                 prompt,
                 generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
+                    "temperature": 0.7,
+                    "max_output_tokens": 1400,
+                    # JSONを出させたいならこれが効くことが多い
+                    "response_mime_type": "application/json",
                 },
             )
-            raw = (resp.text or "").strip()
-            return _extract_json(raw)
+
+            # ここが “候補が空” のとき落ちてた場所
+            if not getattr(resp, "candidates", None):
+                raise RuntimeError(f"Empty candidates. resp={resp}")
+
+            cand0 = resp.candidates[0]
+            finish = getattr(cand0, "finish_reason", None)
+
+            # テキスト取り出し（候補があるのに text が空のこともある）
+            text = getattr(resp, "text", None)
+            if not text:
+                raise RuntimeError(f"No text returned. finish_reason={finish}")
+
+            return _extract_json(text)
 
         except Exception as e:
             last_err = e
-            msg = str(e).lower()
-            # 429/limit系はより待つ（指数バックオフ）
-            if "429" in msg or "rate" in msg or "limit" in msg or "resource" in msg:
-                time.sleep(min(20.0, base_sleep * (2 ** i) + 0.3))
-            else:
-                time.sleep(min(8.0, base_sleep * (1.6 ** i) + 0.2))
+            print("=== Gemini error ===")
+            traceback.print_exc()
+            time.sleep(sleep_sec)
 
     raise RuntimeError(f"Gemini failed: {last_err}")
