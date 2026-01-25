@@ -1,73 +1,114 @@
 # llm_gemini.py
 from __future__ import annotations
-import os
-import time
+
 import json
-import random
-from typing import List, Dict, Any
+import os
+import re
+import time
+from typing import Any, Dict, Optional
 
 import google.generativeai as genai
 
-def load_key() -> str:
-    # Streamlit secrets優先は app.py 側で渡す想定だが、保険としてEnvも読む
-    return (os.getenv("Gemini_API_KEY") or os.getenv("Gemini_API_KEY") or "").strip()
 
-def _sleep_jitter(base: float):
-    time.sleep(base + random.uniform(0, 0.25))
+def _extract_json_loose(raw: str) -> Dict[str, Any]:
+    """
+    返答に余計な文字が混ざっても最初の { ... } を抜く。
+    """
+    s = raw.find("{")
+    e = raw.rfind("}")
+    if s == -1 or e == -1 or e <= s:
+        raise ValueError(f"JSON not found in response:\n{raw[:1200]}")
+    body = raw[s : e + 1]
+    return json.loads(body)
+
+
+def _safe_text_from_response(resp) -> str:
+    """
+    resp.text が ValueError を投げるケースがあるので、
+    candidates/parts から安全に抽出する。
+    """
+    # 1) まず resp.text を試す（ただし落ちる可能性）
+    try:
+        t = getattr(resp, "text", None)
+        if t:
+            return str(t).strip()
+    except Exception:
+        pass
+
+    # 2) candidates があるなら parts/text を拾う
+    cands = getattr(resp, "candidates", None) or []
+    for c in cands:
+        content = getattr(c, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        buf = []
+        for p in parts:
+            # p.text がある場合
+            txt = getattr(p, "text", None)
+            if txt:
+                buf.append(str(txt))
+        if buf:
+            return "".join(buf).strip()
+
+    # 3) ここまで来たら「テキストがない」
+    # Safety/ブロック理由などをヒントとして含めてエラーにする
+    fb = getattr(resp, "prompt_feedback", None)
+    fr = None
+    try:
+        if cands:
+            fr = getattr(cands[0], "finish_reason", None)
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Gemini response has no extractable text. "
+        f"finish_reason={fr}, prompt_feedback={fb}"
+    )
+
 
 def gemini_generate_json(
     prompt: str,
-    api_key: str,
+    api_key: Optional[str] = None,
     model: str = "gemini-flash-latest",
-    max_output_tokens: int = 2048,
     temperature: float = 0.7,
+    max_output_tokens: int = 2048,
     min_interval_sec: float = 2.0,
-    max_retries: int = 6,
+    session_key: str = "last_gemini_call_ts",
 ) -> Dict[str, Any]:
     """
-    途切れないJSON取得（説明文禁止）
+    - レート制限回避: min_interval_sec で間隔を空ける
+    - JSONだけ返す想定だが、余計なテキスト混入にも耐える
+    - resp.text が落ちても candidates から拾う
     """
+    api_key = api_key or os.getenv("Gemini_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("Gemini_API_KEY is not set")
-
-    # RPM回避：呼び出し間隔を強制
-    now = time.time()
-    last = getattr(gemini_generate_json, "_last_call", 0.0)
-    wait = min_interval_sec - (now - last)
-    if wait > 0:
-        _sleep_jitter(wait)
-    gemini_generate_json._last_call = time.time()
+        raise RuntimeError("Gemini_API_KEY is not set (Secrets/Env)")
 
     genai.configure(api_key=api_key)
     m = genai.GenerativeModel(model)
 
-    # リトライ（429/5xx/変な返答）
-    backoff = 1.5
-    for attempt in range(max_retries):
-        try:
-            resp = m.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
-            )
-            text = (resp.text or "").strip()
+    # 最低間隔を空ける（Streamlit で st.session_state を使う場合は app.py 側でやるのが理想）
+    # ここは「関数単体でも事故りにくい」保険
+    now = time.time()
+    # グローバル変数に保存（簡易）
+    if not hasattr(gemini_generate_json, session_key):
+        setattr(gemini_generate_json, session_key, 0.0)
+    last = getattr(gemini_generate_json, session_key)
+    wait = min_interval_sec - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    setattr(gemini_generate_json, session_key, time.time())
 
-            # JSONだけ抽出（前後に余計な文が混ざっても拾う）
-            s = text.find("{")
-            e = text.rfind("}")
-            if s == -1 or e == -1 or e <= s:
-                raise ValueError(f"JSON not found:\n{text}")
+    resp = m.generate_content(
+        prompt,
+        generation_config={
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        },
+    )
 
-            data = json.loads(text[s:e+1])
-            return data
+    raw = _safe_text_from_response(resp)
 
-        except Exception as e:
-            # 429/RateLimitっぽい場合もここに落ちることがある
-            if attempt == max_retries - 1:
-                raise
-            _sleep_jitter(backoff)
-            backoff *= 1.8
-
-    raise RuntimeError("unreachable")
+    # JSON抽出（余計な文が混ざっても耐える）
+    return _extract_json_loose(raw)
