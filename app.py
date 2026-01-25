@@ -305,10 +305,27 @@ with tab1:
 
         st.info("生成開始：RPM/RPDを守りつつ、候補をローカルで増殖→自己対局します。")
 
-        # --- API生成（3回だけ） ---
-        all_main = api_generate("MAIN", topic, trend_hint, per_role, api_key, model); usage = usage_inc(usage, 1); save_json(U_PATH, usage)
-        all_sub  = api_generate("SUB",  topic, trend_hint, per_role, api_key, model); usage = usage_inc(usage, 1); save_json(U_PATH, usage)
-        all_exp  = api_generate("EXP",  topic, trend_hint, per_role, api_key, model); usage = usage_inc(usage, 1); save_json(U_PATH, usage)
+        from prompts import build_prompt_all  # ← 追加
+
+        # --- API 1回だけ ---
+        prompt = build_prompt_all(topic, trend_hint, per_role, per_role, per_role)
+        rl.wait_for_rpm()
+        data = gemini_json(
+            prompt,
+            api_key=api_key,
+            model=model,
+            max_output_tokens=1400,
+            temperature=0.7,
+            retries=2,
+            sleep_sec=2.2,
+        )
+
+        usage = usage_inc(usage, 1)
+        save_json(U_PATH, usage)
+
+        all_main = [postprocess_tweet(str(x)) for x in data.get("MAIN", [])]
+        all_sub  = [postprocess_tweet(str(x)) for x in data.get("SUB", [])]
+        all_exp  = [postprocess_tweet(str(x)) for x in data.get("EXP", [])]
                         # 返りが少なすぎる時は安全に停止（増殖の質が死ぬ）
         if len(all_main) < 5 or len(all_sub) < 5 or len(all_exp) < 5:
             st.error("生成件数が少なすぎます（<5）。もう一度実行してください。")
