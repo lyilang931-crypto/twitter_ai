@@ -1,85 +1,107 @@
 # generate.py
-import json
-from llm_gemini import gemini_generate
+from __future__ import annotations
+import time
+from typing import List, Dict, Any
 
-def _extract_json(raw: str) -> dict:
-    s = raw.find("{")
-    e = raw.rfind("}")
-    if s == -1 or e == -1 or e <= s:
-        raise ValueError(f"JSON not found:\n{raw}")
-    body = raw[s:e+1]
-    return json.loads(body)
+from llm_gemini import gemini_generate_json
 
-def generate_daily_pack(
-    api_key: str,
-    topic: str,
-    trend_context: str = "",
-    per_role_n: int = 5,
-    model: str = "gemini-flash-latest",
-):
-    trend_block = ""
-    tc = (trend_context or "").strip()
-    if tc:
-        trend_block = f"""
-【トレンド情報（最優先で活用）】
-{tc}
+SYSTEM_RULES = """
+【絶対厳守】
+- 個人情報・特定可能情報（固有名詞/地名/勤務先/学校/住所/予定/連絡先）を出さない
+- 政治/宗教/差別/誹謗中傷/個人攻撃/過激煽りは禁止
+- 断定・短文・構造重視
+- 絵文字は使わない
+- 1投稿は140字以内（目安：120字以内）
+- 出力は必ず有効なJSONで閉じる（説明文/コードブロック禁止）
+"""
+
+def build_voice(voice_guide: str) -> str:
+    # あなたっぽさ（ただし個人特定はしない）
+    base = """
+【口調（あなたっぽさ）】
+- 断定・短文・構造重視
+- 根性より設計、足し算より引き算
+- 期待値・再現性・時間＝命
+- 最後は行動1つ、または軽い問いで締める
+- テーマは経済・起業・成長・習慣・意思決定
 """.strip()
+    if voice_guide and voice_guide.strip():
+        return base + "\n\n【追加の声】\n" + voice_guide.strip()
+    return base
 
-    prompt = f"""
-あなたはX(Twitter)の投稿文を作るプロです。
+def _prompt(topic: str, n: int, role: str, intent: str, voice: str) -> str:
+    return f"""
+{SYSTEM_RULES}
 
-テーマ:
-{topic}
+{voice}
 
-{trend_block}
+テーマ: {topic}
+役割: {role}
+狙い: {intent}
 
-次のJSONだけを返してください（説明文は禁止、コードブロック禁止、前置き禁止）:
+次のJSONだけを返す:
 {{
-  "MAIN": ["..."],  // 朝(7-9) 本命：否定×断定（刺す）
-  "SUB":  ["..."],  // 昼(12-13) 準本命：否定×数字（冷静に分解）
-  "EXP":  ["..."]   // 夜(20-22) 実験：質問×逆説（学習用）
+  "tweets": ["...","..."]
 }}
 
-制約（絶対）:
-- 各配列は {per_role_n} 件
-- 各ツイートは 120文字以内
-- 絵文字は使わない
-- 固有名詞/住所/勤務先/学校/予定/連絡先など個人特定情報は禁止
-- 政治/宗教/差別/誹謗中傷/攻撃語/過激煽りは禁止
-- 「今っぽさ」は、流行語の羅列ではなく“切り口”で表現
-- 出力は必ず有効なJSONとして閉じる（末尾の括弧まで）
+制約:
+- tweetsは必ず {n} 件
+- 各ツイートは140字以内
+- 日本語
 """.strip()
 
-    raw = gemini_generate(
-        prompt,
-        api_key=api_key,
-        model=model,
-        max_output_tokens=1800,
-        temperature=0.75,
-    )
+def generate_200(
+    api_key: str,
+    topic: str,
+    model: str = "gemini-flash-latest",
+    batch: int = 25,
+    total: int = 200,
+    min_interval_sec: float = 2.0,
+    voice_guide: str = "",
+    role: str = "EXP",
+    intent: str = "質問×逆説（上振れ探索）",
+) -> List[str]:
+    voice = build_voice(voice_guide)
 
-    data = _extract_json(raw)
-    for k in ["MAIN", "SUB", "EXP"]:
-        if k not in data or not isinstance(data[k], list):
-            raise ValueError(f"Invalid schema. Missing {k}.\n{raw}")
+    out: List[str] = []
+    rounds = (total + batch - 1) // batch
 
-    def block(role, role_label, time_slot, time_slot_label, intent, texts):
-        cleaned = []
-        for t in texts:
-            s = str(t).strip().replace("\n", " ")
-            if 0 < len(s) <= 140:  # 念のため140まで許容
-                cleaned.append(s)
-        return {
-            "role": role,
-            "role_label": role_label,
-            "time_slot": time_slot,
-            "time_slot_label": time_slot_label,
-            "intent": intent,
-            "candidates": cleaned[:per_role_n],
-        }
+    for i in range(rounds):
+        need = min(batch, total - len(out))
+        if need <= 0:
+            break
 
-    return [
-        block("MAIN", "本命（勝ちに行く）", "AM", "朝（7-9時）", "否定×断定", data["MAIN"]),
-        block("SUB",  "準本命（微調整）", "NOON", "昼（12-13時）", "否定×数字", data["SUB"]),
-        block("EXP",  "実験（学習）", "PM", "夜（20-22時）", "質問×逆説", data["EXP"]),
-    ]
+        p = _prompt(topic, need, role=role, intent=intent, voice=voice)
+        data = gemini_generate_json(
+            p,
+            api_key=api_key,
+            model=model,
+            max_output_tokens=2048,
+            temperature=0.75,
+            min_interval_sec=min_interval_sec,
+        )
+        tweets = data.get("tweets", [])
+        if not isinstance(tweets, list):
+            tweets = []
+
+        for t in tweets:
+            s = str(t).strip()
+            if not s:
+                continue
+            # 140字超えを切る（最後の保険）
+            if len(s) > 140:
+                s = s[:140]
+            out.append(s)
+
+        # RPM回避のため小休止（分割生成の間）
+        time.sleep(0.4)
+
+    # 重複を軽く除去
+    uniq = []
+    seen = set()
+    for t in out:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+
+    return uniq[:total]
