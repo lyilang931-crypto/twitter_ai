@@ -12,7 +12,7 @@ SAFETY_CORE = (
     "政治/宗教/差別/誹謗中傷/個人攻撃/過激煽り。"
 )
 
-def build_prompt(topic: str, trend_hint: str, n: int, role: str) -> str:
+def build_prompt_all(topic: str, trend_hint: str, n: int, role: str) -> str:
     # TPM250を守るため短い。出力はJSON限定。
     # role別に“尖り方”を変える
     if role == "MAIN":
