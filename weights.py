@@ -1,50 +1,32 @@
 # weights.py
 from __future__ import annotations
-import json
-from typing import Dict, Any, List
-from pseudo_reward import pseudo_features
+import json, os
+from typing import Dict
 
 DEFAULT_W = {
-    "_bias": -0.2,
-    "length_good": 0.8,
-    "assertive": 0.6,
-    "cta": 0.5,
-    "biz": 0.6,
-    "tension": 0.4,
+    "bias": -1.2,
+    "novelty": 1.2,
+    "safety": 2.0,
+    "tail": 1.6,
+    "length_ok": 0.9,
+    "assertive": 0.7,
 }
 
-def load_weights(rows: List[Dict[str, Any]]) -> Dict[str, float]:
-    # CSVに保存していれば最新を読む（なければデフォルト）
-    for r in reversed(rows):
-        wj = r.get("weights_json", "")
-        if wj:
-            try:
-                return json.loads(wj)
-            except Exception:
-                pass
+def load_weights(path: str) -> Dict[str, float]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     return dict(DEFAULT_W)
 
-def update_weights_online(
-    w: Dict[str, float],
-    text: str,
-    pseudo: float,
-    final: float,
-    lr: float = 0.15,
-    l2: float = 0.002
-) -> Dict[str, float]:
-    """
-    誤差 = final - pseudo
-    w <- w + lr * error * feature - l2*w
-    """
-    f = pseudo_features(text)
-    err = float(final) - float(pseudo)
+def save_weights(path: str, w: Dict[str, float]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(w, f, ensure_ascii=False, indent=2)
 
-    nw = dict(w)
-    for k, fv in f.items():
-        nw[k] = float(nw.get(k, 0.0)) + lr * err * float(fv) - l2 * float(nw.get(k, 0.0))
-    nw["_bias"] = float(nw.get("_bias", 0.0)) + lr * err - l2 * float(nw.get("_bias", 0.0))
-
-    # 暴走防止（クリップ）
-    for k in list(nw.keys()):
-        nw[k] = max(-3.0, min(3.0, float(nw[k])))
-    return nw
+def sgd_update(w: Dict[str, float], x: Dict[str, float], y_true: float, y_pred: float, lr: float = 0.35, l2: float = 0.0005):
+    # logistic回帰のSGDっぽく更新（簡易）
+    err = (y_true - y_pred)
+    for k, v in x.items():
+        w[k] = float(w.get(k, 0.0) + lr * err * float(v) - l2 * w.get(k, 0.0))
+    w["bias"] = float(w.get("bias", 0.0) + lr * err - l2 * w.get("bias", 0.0))
+    return w

@@ -1,40 +1,152 @@
 # app.py
 from __future__ import annotations
-import json
 import time
-import os
 from datetime import date
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
-from csvio import read_csv, append_csv
-from weights import load_weights, update_weights_online
-from rating import final_score_from_metrics, update_abs_rating, update_rel_rating
-from self_play import rank_200
-from generate import generate_200
-from safety import safety_check
+from rate_limit import RateLimiter, Limits, rough_token_count
+from llm_gemini import gemini_json
+from prompts import build_prompt
+from safety import safety_score_01, safety_check
+from novelty import novelty_score
+from exp_score import tail_score, exp_utility
+from scoring import pseudo_reward_components, pseudo_score,速報_score,確定_score
+from weights import load_weights, save_weights, sgd_update
+from selfplay import league_score
+from storage import read_rows, append_row, load_json, save_json
 
-CSV_PATH = "twitter_log.csv"
+# =========================
+# 基本設定
+# =========================
+st.set_page_config(page_title="Twitter 将棋AI式（超高速学習・完成版）", layout="wide")
+st.title("Twitter 将棋AI式 自動化（完成版）— 1日3ツイ / 超高速学習 / 制限回避")
 
-st.set_page_config(page_title="Twitter 将棋AI式 自動化（200自己対局 + 学習）", layout="wide")
-st.title("Twitter 将棋AI式 自動化（完成版）— 速報→自己対局200→承認→実測→学習（Gemini固定）")
+# =========================
+# Paths
+# =========================
+LOG_PATH = "data/twitter_log.csv"
+W_PATH = "data/weights.json"
+U_PATH = "data/usage.json"
 
-# ====== ログ読み ======
-rows = read_csv(CSV_PATH)
-weights = load_weights(rows)
+# =========================
+# Limits（ユーザー指定）
+# =========================
+LIMITS = Limits(rpm=5, tpm=250, rpd=20)
+rl = RateLimiter(LIMITS)
 
-def load_secret_key() -> str:
-    # Cloud: st.secrets / Local: env
+def today_key() -> str:
+    return str(date.today())
+
+def load_api_key() -> str:
+    # キー名固定：Gemini_API_KEY
     try:
-        v = st.secrets.get("Gemini_API_KEY", "")  # 固定名
-        if v: return str(v).strip()
+        k = st.secrets.get("Gemini_API_KEY", "")
     except Exception:
-        pass
-    v = os.getenv("Gemini_API_KEY", "") or os.getenv("Gemini_API_KEY", "")
-    return str(v).strip()
+        k = ""
+    return (k or "").strip()
 
-def last_float(col: str, default: float) -> float:
+def usage_can_call(usage: dict) -> bool:
+    d = usage.get(today_key(), {})
+    return int(d.get("calls", 0)) < LIMITS.rpd
+
+def usage_inc(usage: dict, n: int = 1) -> dict:
+    d = usage.get(today_key(), {})
+    d["calls"] = int(d.get("calls", 0)) + n
+    usage[today_key()] = d
+    return usage
+
+def postprocess_tweet(t: str) -> str:
+    t = (t or "").strip()
+    t = t.replace("\n", " ")
+    # 二重引用を雑に除去
+    if t.startswith('"') and t.endswith('"') and len(t) > 2:
+        t = t[1:-1].strip()
+
+    # 長すぎは切る（途切れ防止：句読点で切り、最後に“。”で締める）
+    if len(t) > 140:
+        t = t[:140]
+        # 中途半端に終わるのを軽減
+        if t[-1] not in ["。", "！", "?", "？"]:
+            t = t.rstrip("、, ") + "。"
+
+    # 短すぎ対策：最低ラインを維持（ただし意図的短文があるので軽い補正）
+    if len(t) < 55:
+        t = t + " 今日は何を捨てる？"
+        if len(t) > 140:
+            t = t[:140]
+
+    return t
+
+def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
+    prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
+
+    # TPM250目安チェック（超過しそうなら短縮）
+    if rough_token_count(prompt) > LIMITS.tpm:
+        prompt = prompt[:420]  # 最終手段（安全側）
+
+    rl.wait_for_rpm()
+
+    data = gemini_json(
+        prompt,
+        api_key=api_key,
+        model=model,
+        max_output_tokens=1400,
+        temperature=0.7,
+        retries=2,
+        sleep_sec=2.2,
+    )
+    arr = data.get(role, [])
+    out = []
+    for x in arr:
+        s = postprocess_tweet(str(x))
+        out.append(s)
+    return out
+
+def build_candidates(rows, w, role, texts):
+    cands = []
+    for t in texts:
+        saf = safety_score_01(t)
+        nov = novelty_score(t, rows, window=300)
+        tail = tail_score(t)
+
+        comps = pseudo_reward_components(t, novelty=nov, safety=saf, tail=tail)
+        ps = pseudo_score(comps, w)
+
+        # EXPは分散最大化を上乗せ（“上振れ確率”）
+        if role == "EXP":
+            ps = 0.35 * ps + 0.65 * exp_utility(tail=tail, novelty=nov, safety=saf)
+
+        cands.append({
+            "role": role,
+            "text": t,
+            "safety": saf,
+            "novelty": nov,
+            "tail": tail,
+            "pseudo": ps,
+            "components": comps,
+        })
+    return cands
+
+def choose_top3(main_c, sub_c, exp_c):
+    main_best = main_c[0] if main_c else None
+    sub_best  = sub_c[0] if sub_c else None
+    exp_best  = exp_c[0] if exp_c else None
+    return main_best, sub_best, exp_best
+
+def elo_update(r: float, score01: float, baseline: float = 0.50, k: float = 16.0) -> float:
+    # score01がbaselineより高ければ上がる（簡易Elo）
+    expected = baseline
+    return float(r + k * (score01 - expected))
+
+# =========================
+# Load state
+# =========================
+rows = read_rows(LOG_PATH)
+usage = load_json(U_PATH, {})
+w = load_weights(W_PATH)
+
+def last_rating(col: str, default: float = 1000.0) -> float:
     if not rows:
         return default
     try:
@@ -42,280 +154,344 @@ def last_float(col: str, default: float) -> float:
     except Exception:
         return default
 
-abs_rating_now = last_float("abs_rating_after", 1000.0)
-rel_rating_now = last_float("rel_rating_after", 1000.0)
+abs_rating = last_rating("abs_rating_after", 1000.0)
+rel_rating = last_rating("rel_rating_after", 1000.0)
 
-# ====== Sidebar ======
+# =========================
+# Sidebar
+# =========================
 with st.sidebar:
-    st.subheader("Gemini 設定（キー名はGemini_API_KEY固定）")
-    secret_key = load_secret_key()
+    st.subheader("運用設定（制限回避）")
+    api_key = load_api_key()
+    st.caption(f"RPD: {LIMITS.rpd} / RPM: {LIMITS.rpm} / TPM目安: {LIMITS.tpm}")
+    today_calls = int(usage.get(today_key(), {}).get("calls", 0))
+    st.metric("本日APIコール数", f"{today_calls} / {LIMITS.rpd}")
 
-    override = st.text_input("Gemini API Key（任意：上書き）", type="password", help="通常は空欄でOK（Secrets/Envを使用）")
-    gemini_key = (override.strip() or secret_key)
+    model = "gemini-flash-latest"
+    st.write(f"モデル: **{model}**（固定）")
 
-    if gemini_key:
-        st.caption("✅ API Key 検出済み")
+    if not api_key:
+        st.error("Secretsに GEMINI_API_KEY が未設定です。")
+        st.stop()
+
+    st.subheader("トレンド入力（手入力・最小）")
+    trend_hint = st.text_input("今日のトレンド（任意）", value="日経・AI・スタートアップ・副業・金利")
+
+    st.subheader("候補数（自動最適）")
+    # 制限と速度を最優先。デフォは90案（3回×30）
+    target = st.selectbox("候補規模", ["最速(90案)", "強め(120案)", "重め(150案)"], index=0)
+    if target == "最速(90案)":
+        per_role = 30
+        calls_plan = 3
+    elif target == "強め(120案)":
+        per_role = 40
+        calls_plan = 3
     else:
-        st.warning("⚠️ Gemini_API_KEY 未設定（Secrets推奨）")
+        per_role = 25
+        calls_plan = 6  # 2回に分割して150相当（RPD的にギリ余裕）
 
-    model = st.text_input("モデル", value="gemini-flash-latest")
-    min_interval = st.slider("呼び出し最小間隔（秒）", 1.0, 6.0, 2.0, 0.5)
-    cooldown_sec = st.slider("生成ボタンのクールダウン（秒）", 10, 120, 40, 5)
-
-    st.subheader("あなたっぽさ（任意で追加）")
-    voice_guide = st.text_area(
-        "VOICE_GUIDE",
-        value="根性より設計。足し算より引き算。期待値で決める。時間＝命。最後は今日の一手。",
-        height=120
-    )
-
-    st.subheader("学習（重み更新）")
-    lr = st.slider("学習率 lr", 0.01, 0.50, 0.15, 0.01)
-    l2 = st.slider("正則化 l2", 0.0, 0.02, 0.002, 0.001)
+    st.caption("※『200案』は“内部リーグ200局”で代替（速い＆制限踏まない）。")
 
     st.subheader("レーティング")
-    baseline = st.number_input("Baseline（絶対レート基準）", value=0.50, step=0.01)
-    k_abs = st.number_input("K（絶対）", value=16.0, step=1.0)
-    k_rel = st.number_input("K（相対）", value=16.0, step=1.0)
+    baseline = st.slider("Baseline（勝率基準）", 0.40, 0.70, 0.50, 0.01)
+    k_abs = st.slider("K（絶対）", 4.0, 32.0, 16.0, 1.0)
+    k_rel = st.slider("K（相対）", 4.0, 32.0, 16.0, 1.0)
 
-tab1, tab2, tab3 = st.tabs(["① 生成→自己対局→承認", "② 実測入力（確定スコア）→学習", "③ 分析・重み・棋譜"])
+# =========================
+# Tabs
+# =========================
+tab1, tab2, tab3 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 実測入力(手入力最小/CSV可)", "③ 分析・学習(重み/レート)"])
 
 # =========================================================
 # ① 生成→自己対局→承認
 # =========================================================
 with tab1:
-    st.subheader("今日のテーマ（経済・起業）")
+    st.subheader("今日のテーマ（経済・起業向け）")
     topic = st.text_input("テーマ", value="起業で失敗する人の共通点（経済視点）")
 
     if "last_gen_time" not in st.session_state:
         st.session_state["last_gen_time"] = 0.0
 
-    colA, colB = st.columns([1,1])
-    with colA:
-        main_n = st.number_input("MAIN候補数", min_value=10, max_value=80, value=30, step=5)
-        sub_n  = st.number_input("SUB候補数",  min_value=10, max_value=80, value=30, step=5)
-    with colB:
-        exp_total = st.number_input("EXP総数（内部自己対局）", min_value=50, max_value=300, value=200, step=10)
-        exp_batch = st.number_input("EXPバッチ（分割生成）", min_value=10, max_value=50, value=25, step=5)
-
-    # 生成ボタン
-    if st.button("生成 → 自己対局 → ランキング（MAIN/SUB/EXP）"):
+    if st.button("今日の3ツイ候補を生成 → 仮想自己対局"):
         now = time.time()
-        if now - st.session_state["last_gen_time"] < cooldown_sec:
-            st.warning(f"⏳ レート制限回避のため、あと {int(cooldown_sec - (now - st.session_state['last_gen_time']))} 秒待ってください")
+        if now - float(st.session_state["last_gen_time"]) < 60:
+            st.warning("⏳ レート制限回避のため、60秒ほど待ってから再実行してください")
             st.stop()
 
-        st.session_state["last_gen_time"] = time.time()
+        st.session_state["last_gen_time"] = now
 
-        if not gemini_key:
-            st.error("Gemini_API_KEY が未設定です（Secrets/Env推奨）。")
-            st.stop()
+        # ↓ここから下にあなたの生成処理(pack生成)が続く形にする
+        # 例: pack = ...
 
-        with st.status("生成中（分割生成＋制限回避）…", expanded=True) as status:
-            # MAIN（安定・断定）
-            main = generate_200(
-                api_key=gemini_key,
-                topic=topic,
-                model=model,
-                batch=min(int(exp_batch), 25),
-                total=int(main_n),
-                min_interval_sec=float(min_interval),
-                voice_guide=voice_guide,
-                role="MAIN",
-                intent="否定×断定（安定して勝つ）",
-            )
-            st.write(f"MAIN生成: {len(main)}件")
+        st.info("生成開始：途切れ防止・JSON強制・レート制限待機を自動で行います。")
 
-            # SUB（安定・数字/具体）
-            sub = generate_200(
-                api_key=gemini_key,
-                topic=topic,
-                model=model,
-                batch=min(int(exp_batch), 25),
-                total=int(sub_n),
-                min_interval_sec=float(min_interval),
-                voice_guide=voice_guide,
-                role="SUB",
-                intent="否定×具体（数字/比較/例）",
-            )
-            st.write(f"SUB生成: {len(sub)}件")
+        all_main: list[str] = []
+        all_sub: list[str] = []
+        all_exp: list[str] = []
 
-            # EXP（分散最大化：200自己対局）
-            exp = generate_200(
-                api_key=gemini_key,
-                topic=topic,
-                model=model,
-                batch=int(exp_batch),
-                total=int(exp_total),
-                min_interval_sec=float(min_interval),
-                voice_guide=voice_guide,
-                role="EXP",
-                intent="質問×逆説（上振れ探索）",
-            )
-            st.write(f"EXP生成: {len(exp)}件")
+        def gen_role(role: str, n_each: int) -> list[str]:
+            # RPMを守る
+            rl.wait_for_rpm()
+            texts = api_generate(role, topic, trend_hint, n_each, api_key, model)
+            return texts
 
-            # ランキング（自己対局）
-            main_ranked = rank_200(main, rows, weights, role="MAIN")[:10]
-            sub_ranked  = rank_200(sub,  rows, weights, role="SUB")[:10]
-            exp_ranked  = rank_200(exp,  rows, weights, role="EXP")[:20]
+        # ===== 生成（calls_plan に応じて回す）=====
+        rounds = 1 if calls_plan == 3 else 2
+        for _ in range(rounds):
+            # MAIN
+            if usage_can_call(usage):
+                all_main.extend(gen_role("MAIN", per_role))
+                usage_inc(usage, 1); save_json(U_PATH, usage)
 
-            st.session_state["ranked"] = {
-                "MAIN": main_ranked,
-                "SUB": sub_ranked,
-                "EXP": exp_ranked,
-            }
-            st.session_state["approved"] = {}
-            status.update(label="完了", state="complete")
+            # SUB
+            if usage_can_call(usage):
+                all_sub.extend(gen_role("SUB", per_role))
+                usage_inc(usage, 1); save_json(U_PATH, usage)
 
-    ranked = st.session_state.get("ranked")
-    if ranked:
-        st.caption("候補は『速報スコア＋Novelty＋Safety＋EXP分散スコア』で自己対局ランキング済み。承認して投稿してください。")
+            # EXP
+            if usage_can_call(usage):
+                all_exp.extend(gen_role("EXP", per_role))
+                usage_inc(usage, 1); save_json(U_PATH, usage)
 
-        def show_role(role: str, show_n: int):
-            st.markdown(f"## {role}")
-            for i, c in enumerate(ranked[role][:show_n], start=1):
-                txt = c["text"]
-                safe = safety_check(txt)
-                with st.expander(f"#{i} self={c['selfplay_score']:.3f} | pseudo={c['pseudo_score']:.3f} | nov={c['novelty']:.2f} | safe={int(c['safety'])}"):
-                    st.write(txt)
-                    if not safe.ok:
-                        st.error("安全NG: " + " / ".join(safe.reasons))
-                    st.code(txt)
-                    if st.button(f"この案を承認（{role}）", key=f"approve_{role}_{i}"):
-                        st.session_state["approved"][role] = c
-                        st.success(f"{role} 承認済み")
+        # 重複除去
+        def uniq(xs: list[str]) -> list[str]:
+            seen = set()
+            out = []
+            for x in xs:
+                if x not in seen:
+                    out.append(x)
+                    seen.add(x)
+            return out
 
-        c1, c2 = st.columns(2)
-        with c1:
-            show_role("MAIN", 10)
-        with c2:
-            show_role("SUB", 10)
+        all_main, all_sub, all_exp = uniq(all_main), uniq(all_sub), uniq(all_exp)
 
-        st.markdown("---")
-        show_role("EXP", 20)
+        # 候補 → 擬似採点
+        main_c = build_candidates(rows, w, "MAIN", all_main)
+        sub_c  = build_candidates(rows, w, "SUB", all_sub)
+        exp_c  = build_candidates(rows, w, "EXP", all_exp)
 
-        approved = st.session_state.get("approved", {})
-        if approved:
-            st.markdown("## ✅ 承認済み（投稿用）")
-            for role in ["MAIN","SUB","EXP"]:
-                if role in approved:
-                    st.markdown(f"### {role}")
-                    st.code(approved[role]["text"])
-                else:
-                    st.warning(f"{role} 未承認")
+        # 内部自己対局（200局相当）
+        main_c = league_score(main_c, rounds=200)
+        sub_c  = league_score(sub_c, rounds=200)
+        exp_c  = league_score(exp_c, rounds=200)
+
+        st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        st.success("生成完了。上位候補を表示します。")
+
+        
+
+    pack = st.session_state.get("pack")
+    if pack:
+        st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。安全が0のものは自動で落ちます。")
+
+        def show_role(role, title):
+            st.markdown(f"## {title}")
+            cands = pack.get(role, [])[:10]
+            for i, c in enumerate(cands, start=1):
+                with st.expander(f"#{i}  league={c.get('league',0):.3f}  pseudo={c.get('pseudo',0):.3f}  {c['text'][:30]}..."):
+                    st.write(c["text"])
+                    st.write({
+                        "safety": c["safety"],
+                        "novelty": round(c["novelty"], 3),
+                        "tail": round(c["tail"], 3),
+                        "pseudo": round(c["pseudo"], 3),
+                        "league": round(c.get("league", 0.0), 3),
+                    })
+                    if c["safety"] <= 0.0:
+                        st.warning("Safety=0：危険判定（自動ボツ）")
+                    st.code(c["text"], language=None)
+
+        show_role("MAIN", "朝(7-9) MAIN：本命（否定×断定）")
+        show_role("SUB", "昼(12-13) SUB：準本命（否定×数字/比較）")
+        show_role("EXP", "夜(20-22) EXP：実験（質問×逆説 / 分散最大化）")
+
+        st.markdown("## ✅ 承認（今日の3ツイ）")
+        col1, col2, col3 = st.columns(3)
+
+        def pick(role, idx_key):
+            cands = pack.get(role, [])
+            if not cands:
+                return None
+            idx = st.number_input(idx_key, min_value=1, max_value=min(10, len(cands)), value=1, step=1)
+            return cands[int(idx)-1]
+
+        with col1:
+            a_main = pick("MAIN", "MAINの採用順位(1-10)")
+        with col2:
+            a_sub = pick("SUB", "SUBの採用順位(1-10)")
+        with col3:
+            a_exp = pick("EXP", "EXPの採用順位(1-10)")
+
+        if st.button("この3つを承認して保存（投稿用に固定）"):
+            approved = {"MAIN": a_main, "SUB": a_sub, "EXP": a_exp}
+            st.session_state["approved"] = approved
+            st.success("承認保存しました。②で実測入力へ。")
+            for k, v in approved.items():
+                st.markdown(f"**{k}**")
+                st.code(v["text"])
 
 # =========================================================
-# ② 実測入力（確定スコア）→学習
+# ② 実測入力（手入力最小/CSV可）
 # =========================================================
 with tab2:
-    st.subheader("実測入力（確定スコア）→ 重み学習 → レーティング更新")
+    st.subheader("実測入力：速報→確定（手入力最小）")
     approved = st.session_state.get("approved", {})
-    role_pick = st.selectbox("役割", ["MAIN","SUB","EXP"], index=0)
 
-    default_text = approved.get(role_pick, {}).get("text", "")
+    role_pick = st.selectbox("対象（役割）", ["MAIN","SUB","EXP"], index=0)
+    default_text = (approved.get(role_pick) or {}).get("text", "")
+
+    st.caption("最小入力：tweet_id(任意) + インプレ/いいね/RT/返信 + フォロワー前後（確定スコア用）")
     text = st.text_area("投稿文（コピペ）", value=default_text, height=120)
+    tweet_id = st.text_input("tweet_id（任意）", value="")
 
-    # 速報スコアは、承認済みならそこから、無ければ後で再計算（簡易）
-    pseudo = float(approved.get(role_pick, {}).get("pseudo_score", 0.0) or 0.0)
-    novelty = float(approved.get(role_pick, {}).get("novelty", 0.0) or 0.0)
-    safety01 = float(approved.get(role_pick, {}).get("safety", 0.0) or 0.0)
-    selfplay = float(approved.get(role_pick, {}).get("selfplay_score", 0.0) or 0.0)
-
-    st.caption(f"（記録用）pseudo={pseudo:.3f}, novelty={novelty:.2f}, safety={int(safety01)}, selfplay={selfplay:.3f}")
-
-    colA, colB, colC = st.columns(3)
-    with colA:
-        impressions = st.number_input("インプレッション", min_value=0, value=0, step=1)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        impr = st.number_input("インプレッション", min_value=0, value=0, step=1)
         likes = st.number_input("いいね", min_value=0, value=0, step=1)
-    with colB:
+    with c2:
         rts = st.number_input("RT", min_value=0, value=0, step=1)
         replies = st.number_input("返信", min_value=0, value=0, step=1)
-    with colC:
+    with c3:
         fol_before = st.number_input("フォロワー（前）", min_value=0, value=0, step=1)
         fol_after = st.number_input("フォロワー（後）", min_value=0, value=0, step=1)
 
-    tweet_id = st.text_input("tweet_id（任意）", value="")
+    # 自動採点（擬似）
+    saf = safety_score_01(text)
+    nov = novelty_score(text, rows, window=300)
+    tail = tail_score(text)
+    comps = pseudo_reward_components(text, novelty=nov, safety=saf, tail=tail)
+    ps = pseudo_score(comps, w)
+    if role_pick == "EXP":
+        ps = 0.35 * ps + 0.65 * exp_utility(tail=tail, novelty=nov, safety=saf)
 
-    if st.button("保存 → 学習 → レーティング更新"):
-        final = final_score_from_metrics(
-            impr=int(impressions),
-            likes=int(likes),
-            rts=int(rts),
-            replies=int(replies),
-            fol_before=int(fol_before),
-            fol_after=int(fol_after),
-        )
+    s速報 =速報_score(int(impr), int(likes), int(rts), int(replies))
+    s確定 =確定_score(int(impr), int(likes), int(rts), int(replies), int(fol_before), int(fol_after))
 
-        # 重み更新（疑似と実測のズレで学習）
-        new_w = update_weights_online(
-            weights,
-            text=text,
-            pseudo=float(pseudo),
-            final=float(final),
-            lr=float(lr),
-            l2=float(l2),
-        )
+    st.write("### 自動採点")
+    st.write({
+        "Pseudo(擬似)": round(ps, 3),
+        "速報": round(s速報, 3),
+        "確定": round(s確定, 3),
+        "novelty": round(nov, 3),
+        "safety": saf,
+        "tail": round(tail, 3),
+    })
 
-        # レーティング更新（絶対 + 相対）
-        abs_before = abs_rating_now
-        rel_before = rel_rating_now
+    if st.button("保存（棋譜に追加）＋ 重み学習（擬似↔確定ズレ）＋ レート更新"):
 
-        # 相対基準：直近30件のfinal平均
-        finals = []
-        for r in rows[-30:]:
-            try:
-                finals.append(float(r.get("final_score", 0.0) or 0.0))
-            except Exception:
-                pass
-        self_base = (sum(finals)/len(finals)) if finals else 0.5
+        # 学習：擬似→確定のズレで重み更新
+        y_true = float(s確定)
+        y_pred = float(ps)
+        w = sgd_update(w, comps, y_true=y_true, y_pred=y_pred, lr=0.35, l2=0.0005)
+        save_weights(W_PATH, w)
 
-        abs_after = update_abs_rating(abs_before, final, baseline=float(baseline), k=float(k_abs))
-        rel_after = update_rel_rating(rel_before, final, self_baseline=float(self_base), k=float(k_rel))
+        # レート更新（絶対/相対）
+        abs_before = abs_rating
+        rel_before = rel_rating
+
+        abs_rating = elo_update(abs_rating, score01=y_true, baseline=float(baseline), k=float(k_abs))
+        # 相対：自分の最近平均（簡易）
+        tail_rows = rows[-30:] if len(rows) > 30 else rows
+        if tail_rows:
+            recent_mean = sum(float(r.get("確定", 0) or 0) for r in tail_rows) / max(1, len(tail_rows))
+        else:
+            recent_mean = 0.50
+        rel_rating = elo_update(rel_rating, score01=y_true, baseline=float(recent_mean), k=float(k_rel))
 
         row = {
             "date": str(date.today()),
             "role": role_pick,
             "tweet_id": tweet_id,
             "text": text.strip(),
-            "impressions": int(impressions),
-             "likes": int(likes),
+            "impressions": int(impr),
+            "likes": int(likes),
             "rts": int(rts),
             "replies": int(replies),
             "followers_before": int(fol_before),
             "followers_after": int(fol_after),
-            "pseudo_score": f"{float(pseudo):.6f}",         # 速報
-            "novelty": f"{float(novelty):.6f}",
-            "safety01": f"{float(safety01):.1f}",
-            "selfplay_score": f"{float(selfplay):.6f}",
-            "final_score": f"{float(final):.6f}",          # 確定
-            "abs_rating_before": f"{float(abs_before):.3f}",
-            "abs_rating_after": f"{float(abs_after):.3f}",
-            "rel_rating_before": f"{float(rel_before):.3f}",
-            "rel_rating_after": f"{float(rel_after):.3f}",
-            "self_baseline": f"{float(self_base):.6f}",
-            "weights_json": json.dumps(new_w, ensure_ascii=False, sort_keys=True),
+            "Pseudo": f"{ps:.6f}",
+            "速報": f"{s速報:.6f}",
+            "確定": f"{s確定:.6f}",
+            "novelty": f"{nov:.6f}",
+            "safety": f"{saf:.0f}",
+            "tail": f"{tail:.6f}",
+            "abs_rating_before": f"{abs_before:.2f}",
+            "abs_rating_after": f"{abs_rating:.2f}",
+            "rel_rating_before": f"{rel_before:.2f}",
+            "rel_rating_after": f"{rel_rating:.2f}",
         }
+        append_row(LOG_PATH, row)
+        rows = read_rows(LOG_PATH)
 
-        append_csv(CSV_PATH, row)
-        st.success("保存＆学習しました。次回から疑似報酬が賢くなります。")
-        st.info(f"final={final:.3f} | 絶対 {abs_before:.1f}→{abs_after:.1f} | 相対 {rel_before:.1f}→{rel_after:.1f}")
-        st.rerun()
+        st.success("保存＆学習しました。次の生成から“擬似評価の精度”が上がります。")
+        st.info(f"Abs: {abs_before:.1f} → {abs_rating:.1f} / Rel: {rel_before:.1f} → {rel_rating:.1f}")
+
+    st.markdown("---")
+    st.subheader("CSV一括取り込み（手入力削減）")
+    up = st.file_uploader("Xの分析CSV（任意）", type=["csv"])
+    if up is not None:
+        df = pd.read_csv(up)
+        st.dataframe(df.head(20), use_container_width=True)
+        st.caption("列名が違ってもOK。必要列を選んでマッピングしてください。")
+        cols = list(df.columns)
+
+        map_id = st.selectbox("tweet_id列", ["(なし)"] + cols, index=0)
+        map_text = st.selectbox("text列", ["(なし)"] + cols, index=0)
+        map_impr = st.selectbox("impressions列", ["(なし)"] + cols, index=0)
+        map_likes = st.selectbox("likes列", ["(なし)"] + cols, index=0)
+        map_rts = st.selectbox("rts列", ["(なし)"] + cols, index=0)
+        map_replies = st.selectbox("replies列", ["(なし)"] + cols, index=0)
+        map_fol_b = st.selectbox("followers_before列", ["(なし)"] + cols, index=0)
+        map_fol_a = st.selectbox("followers_after列", ["(なし)"] + cols, index=0)
+        map_role = st.selectbox("role列(任意)", ["(なし)"] + cols, index=0)
+
+        if st.button("CSVを自動学習（擬似↔確定ズレで重み更新）"):
+            learned = 0
+            for _, r in df.iterrows():
+                txt = str(r[map_text]) if map_text != "(なし)" else ""
+                if not txt:
+                    continue
+                impr = int(r[map_impr]) if map_impr != "(なし)" else 0
+                likes = int(r[map_likes]) if map_likes != "(なし)" else 0
+                rts = int(r[map_rts]) if map_rts != "(なし)" else 0
+                replies = int(r[map_replies]) if map_replies != "(なし)" else 0
+                fb = int(r[map_fol_b]) if map_fol_b != "(なし)" else 0
+                fa = int(r[map_fol_a]) if map_fol_a != "(なし)" else 0
+
+                saf = safety_score_01(txt)
+                nov = novelty_score(txt, rows, window=300)
+                tail = tail_score(txt)
+                comps = pseudo_reward_components(txt, novelty=nov, safety=saf, tail=tail)
+                ps = pseudo_score(comps, w)
+                y_true = float(確定_score(impr, likes, rts, replies, fb, fa))
+                w = sgd_update(w, comps, y_true=y_true, y_pred=ps, lr=0.25, l2=0.0005)
+                learned += 1
+
+            save_weights(W_PATH, w)
+            st.success(f"CSVから学習完了: {learned}件")
+            st.info("次回生成から精度が上がります。")
 
 # =========================================================
-# ③ 分析・重み・棋譜
+# ③ 分析・学習（重み/レート）
 # =========================================================
 with tab3:
-    st.subheader("棋譜・重み・推移")
-    if not rows:
-        st.warning("まだ棋譜がありません。②で実測を入力してください。")
-    else:
+    st.subheader("レーティング & 学習状態")
+    colA, colB, colC = st.columns(3)
+    colA.metric("Abs Rating", f"{abs_rating:.1f}")
+    colB.metric("Rel Rating", f"{rel_rating:.1f}")
+    colC.metric("Weights更新日", str(date.today()))
+
+    st.write("### 学習中の重み（擬似→確定の当たり方）")
+    st.json(w)
+
+    if rows:
         df = pd.DataFrame(rows)
-        for c in ["pseudo_score","final_score","abs_rating_after","rel_rating_after","impressions","likes","rts","replies","followers_after","followers_before","novelty","selfplay_score","safety01"]:
+        for c in ["Pseudo","速報","確定","novelty","tail","abs_rating_after","rel_rating_after"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-        st.dataframe(df.tail(50), use_container_width=True)
+        st.write("### 最近の棋譜（30件）")
+        st.dataframe(df.tail(30), use_container_width=True)
 
-        st.markdown("### 現在の重み（疑似報酬の評価関数）")
-        st.json(weights)
-
-        st.caption("ポイント：『疑似が外した誤差』で重みが動くので、投稿→実測入力を繰り返すほど精度が上がります。")
+        st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")
+    else:
+        st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。")
