@@ -11,7 +11,7 @@ import pandas as pd
 
 from rate_limit import RateLimiter, Limits, rough_token_count
 from llm_gemini import gemini_json
-from prompts import build_prompt
+from prompts import build_prompt_all
 
 from safety import safety_score_01
 from novelty import novelty_score
@@ -144,7 +144,7 @@ def local_expand(seeds: list[str], target_n: int) -> list[str]:
 # API生成（roleごと）
 # =========================
 def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
-    prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
+    prompt = build_prompt_all(topic=topic, trend_hint=trend_hint, n=n, role=role)
 
     # TPM250目安（入力が長いなら短縮）
     if rough_token_count(prompt) > LIMITS.tpm:
