@@ -156,10 +156,6 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
         prompt,
         api_key=api_key,
         model=model,
-        max_output_tokens=1400,
-        temperature=0.7,
-        retries=2,
-        sleep_sec=2.2,
     )
     arr = data.get(role, [])
     return [postprocess_tweet(str(x)) for x in arr]
