@@ -150,7 +150,7 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
     if rough_token_count(prompt) > LIMITS.tpm:
         prompt = prompt[:420]
 
-    rl.wait_for_rpm()
+    rl.wait(input_tokens=rough_token_count(prompt))
 
     data = gemini_json(
         prompt,
