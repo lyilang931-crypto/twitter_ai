@@ -305,11 +305,11 @@ with tab1:
 
         st.info("生成開始：RPM/RPDを守りつつ、候補をローカルで増殖→自己対局します。")
 
-        from prompts import build_prompt_all  # ← 追加
+        prompt = build_prompt_all(topic, trend_hint, per_role)
 
-        # --- API 1回だけ ---
-        prompt = build_prompt_all(topic, trend_hint, per_role, per_role, per_role)
+        # RPM5を守る
         rl.wait_for_rpm()
+
         data = gemini_json(
             prompt,
             api_key=api_key,
@@ -320,8 +320,10 @@ with tab1:
             sleep_sec=2.2,
         )
 
+        # 使用回数カウント（APIは1回）
         usage = usage_inc(usage, 1)
         save_json(U_PATH, usage)
+        st.session_state["usage"] = usage  # セッション保持してるなら
 
         all_main = [postprocess_tweet(str(x)) for x in data.get("MAIN", [])]
         all_sub  = [postprocess_tweet(str(x)) for x in data.get("SUB", [])]
