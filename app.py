@@ -42,7 +42,7 @@ def load_api_key() -> str:
     # キー名固定：Gemini_API_KEY
     k = ""
     try:
-        k = st.secrets.get("GEMINI_API_KEY", "")
+        k = st.secrets.get("Gemini_API_KEY", "")
     except Exception:
         k = ""
     return (k or "").strip()
@@ -172,7 +172,7 @@ with st.sidebar:
     st.write(f"モデル: **{model}**（固定）")
 
     if not api_key:
-        st.error("Secretsに GEMINI_API_KEY が未設定です。")
+        st.error("Secretsに Gemini_API_KEY が未設定です。")
         st.stop()
 
     st.subheader("トレンド入力（手入力・最小）")
