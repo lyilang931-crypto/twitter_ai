@@ -19,8 +19,8 @@ from storage import read_rows, append_row, load_json, save_json
 # =========================
 # 基本設定
 # =========================
-st.set_page_config(page_title="Twitter 将棋AI式（超高速学習・完成版）", layout="wide")
-st.title("Twitter 将棋AI式 自動化（完成版）— 1日3ツイ / 超高速学習 / 制限回避")
+st.set_page_config(page_title="TwitterAI", layout="wide")
+st.title("Twitter自動化/ 超高速学習")
 
 # =========================
 # Paths
@@ -73,11 +73,7 @@ def postprocess_tweet(t: str) -> str:
 
     # 短すぎ対策：最低ラインを維持（ただし意図的短文があるので軽い補正）
     if len(t) < 55:
-        t = t + " 今日は何を捨てる？"
-        if len(t) > 140:
-            t = t[:140]
-
-    return t
+        pass
 
 def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
     prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)

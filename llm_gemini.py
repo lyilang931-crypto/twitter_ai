@@ -14,7 +14,7 @@ def _extract_json(raw: str) -> Dict[str, Any]:
 def gemini_json(
     prompt: str,
     api_key: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-2.5-flash-lite",
     max_output_tokens: int = 1400,
     temperature: float = 0.7,
     retries: int = 2,
