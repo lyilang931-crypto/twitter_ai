@@ -168,7 +168,7 @@ with st.sidebar:
     today_calls = int(usage.get(today_key(), {}).get("calls", 0))
     st.metric("本日APIコール数", f"{today_calls} / {LIMITS.rpd}")
 
-    model = "gemini-flash-latest"
+    model = 'gemini-3-flash'
     st.write(f"モデル: **{model}**（固定）")
 
     if not api_key:
