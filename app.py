@@ -486,7 +486,6 @@ with tab3:
         st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")
     else:
         st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。") # selfplay.py
-from __future__ import annotations
 import random
 from typing import List, Dict, Any, Tuple
 
