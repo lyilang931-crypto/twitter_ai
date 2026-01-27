@@ -119,6 +119,8 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
 def build_candidates(rows, w, role, texts):
     cands = []
     for t in texts:
+        if not isinstance(t, str) or not t.strip():
+            continue
         saf = safety_score_01(t)
         nov = novelty_score(t, rows, window=300)
         tail = tail_score(t)
