@@ -118,6 +118,7 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
 
 def build_candidates(rows, w, role, texts):
     cands = []
+    st.write("DEBUG", role, "texts len =", len(texts), "sample =", repr(texts[:3]))
     for t in texts:
         if not isinstance(t, str) or not t.strip():
             continue
