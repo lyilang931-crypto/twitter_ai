@@ -120,13 +120,40 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
         st.warning(f"⚠️ 予期しないエラーが発生しました: {str(e)}")
         return []
 
+# 明確に危険で除外すべき理由（2段階safetyの第1段階）
+DANGEROUS_REASONS = ["暴力/過激", "差別/属性一般化", "個人攻撃"]
+
 def build_candidates(rows, w, role, texts):
+    """
+    候補を構築。textがNone/emptyは除外。
+    safety<=0でも、明確に危険でない限りflaggedフラグを付けて保持。
+    """
     cands = []
+    empty_text_dropped = 0
+    safety_dropped_count = 0
+    safety_flagged_count = 0
+    
     for t in texts:
         # None や空文字列、非文字列を安全に除外
         if not t or not isinstance(t, str) or not t.strip():
+            empty_text_dropped += 1
             continue
+        
+        # safety_checkで詳細な理由を取得
+        safety_result = safety_check(t)
         saf = safety_score_01(t)
+        
+        # 2段階safety: 明確に危険な理由がある場合のみ除外
+        has_dangerous_reason = any(reason in DANGEROUS_REASONS for reason in safety_result.reasons)
+        if has_dangerous_reason:
+            safety_dropped_count += 1
+            continue  # 除外
+        
+        # safety<=0の候補はflaggedフラグを付けて保持
+        flagged = (saf <= 0.0)
+        flagged_reason = ", ".join(safety_result.reasons) if safety_result.reasons else "safety<=0"
+        if flagged:
+            safety_flagged_count += 1
         nov = novelty_score(t, rows, window=300)
         tail = tail_score(t)
 
@@ -145,8 +172,16 @@ def build_candidates(rows, w, role, texts):
             "tail": tail,
             "pseudo": ps,
             "components": comps,
+            "flagged": flagged,
+            "flagged_reason": flagged_reason,
         })
-    return cands
+    
+    return cands, {
+        "empty_text_dropped": empty_text_dropped,
+        "safety_dropped_count": safety_dropped_count,
+        "safety_flagged_count": safety_flagged_count,
+        "final_count": len(cands),
+    }
 
 def choose_top3(main_c, sub_c, exp_c):
     main_best = main_c[0] if main_c else None
@@ -277,9 +312,31 @@ with tab1:
         all_main, all_sub, all_exp = uniq(all_main), uniq(all_sub), uniq(all_exp)
 
         # 候補 → 擬似採点
-        main_c = build_candidates(rows, w, "MAIN", all_main)
-        sub_c  = build_candidates(rows, w, "SUB", all_sub)
-        exp_c  = build_candidates(rows, w, "EXP", all_exp)
+        main_c, main_stats = build_candidates(rows, w, "MAIN", all_main)
+        sub_c, sub_stats = build_candidates(rows, w, "SUB", all_sub)
+        exp_c, exp_stats = build_candidates(rows, w, "EXP", all_exp)
+
+        # デバッグカウンターを表示
+        generated_count = len(all_main) + len(all_sub) + len(all_exp)
+        total_empty_dropped = main_stats["empty_text_dropped"] + sub_stats["empty_text_dropped"] + exp_stats["empty_text_dropped"]
+        total_safety_dropped = main_stats["safety_dropped_count"] + sub_stats["safety_dropped_count"] + exp_stats["safety_dropped_count"]
+        total_safety_flagged = main_stats["safety_flagged_count"] + sub_stats["safety_flagged_count"] + exp_stats["safety_flagged_count"]
+        total_final = main_stats["final_count"] + sub_stats["final_count"] + exp_stats["final_count"]
+        
+        st.caption(f"📊 生成統計: 生成={generated_count}, 空文字除外={total_empty_dropped}, 危険除外={total_safety_dropped}, 警告付き={total_safety_flagged}, 最終候補={total_final}")
+        
+        # fallback: 最終候補が0の場合、flagged候補も含めて表示
+        if total_final == 0:
+            st.warning("⚠️ 最終候補が0件です。警告付き候補も含めて再評価します。")
+            # flagged候補も含めて再構築（危険なもの以外は全て保持）
+            main_c_fallback, _ = build_candidates(rows, w, "MAIN", all_main)
+            sub_c_fallback, _ = build_candidates(rows, w, "SUB", all_sub)
+            exp_c_fallback, _ = build_candidates(rows, w, "EXP", all_exp)
+            if len(main_c_fallback) > 0 or len(sub_c_fallback) > 0 or len(exp_c_fallback) > 0:
+                main_c = main_c_fallback
+                sub_c = sub_c_fallback
+                exp_c = exp_c_fallback
+                st.info("警告付き候補を含めて表示します。")
 
         # 内部自己対局（200局相当）
         main_c = league_score(main_c, rounds=200)
@@ -292,7 +349,7 @@ with tab1:
 
     pack = st.session_state.get("pack")
     if pack:
-        st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。安全が0のものは自動で落ちます。")
+        st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。警告付き候補（政治/経済など）も表示されます。")
 
         def show_role(role, title):
             st.markdown(f"## {title}")
@@ -316,6 +373,10 @@ with tab1:
                     t = "(no text)"
                 preview = t.replace("\n", " ")[:30]
 
+                # flagged フラグを取得
+                flagged = c.get("flagged", False)
+                flagged_reason = c.get("flagged_reason", "")
+
                 # 数値を安全に取得（デフォルト値付き）
                 league_val = c.get("league", 0.0)
                 pseudo_val = c.get("pseudo", 0.0)
@@ -324,7 +385,9 @@ with tab1:
                 if not isinstance(pseudo_val, (int, float)):
                     pseudo_val = 0.0
 
-                with st.expander(f"#{i} league={league_val:.3f} pseudo={pseudo_val:.3f} {preview}..."):
+                # expanderタイトルに警告マークを追加
+                title_prefix = "⚠️ " if flagged else ""
+                with st.expander(f"{title_prefix}#{i} league={league_val:.3f} pseudo={pseudo_val:.3f} {preview}..."):
                     st.write(t)
                     # 安全に dict の値を取得
                     safety_val = c.get("safety", 0.0)
@@ -337,8 +400,9 @@ with tab1:
                         "pseudo": round(pseudo_val, 3),
                         "league": round(league_val, 3),
                     })
-                    if isinstance(safety_val, (int, float)) and safety_val <= 0.0:
-                        st.warning("Safety=0：危険判定（自動ボツ）")
+                    # flagged候補を警告表示（黄色）
+                    if flagged:
+                        st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
                     st.code(t, language=None)
 
         show_role("MAIN", "朝(7-9) MAIN：本命（否定×断定）")
@@ -375,7 +439,11 @@ with tab1:
             for k, v in approved.items():
                 if v and isinstance(v, dict):
                     text_val = v.get("text", "")
+                    flagged = v.get("flagged", False)
+                    flagged_reason = v.get("flagged_reason", "")
                     st.markdown(f"**{k}**")
+                    if flagged:
+                        st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
                     st.code(text_val if text_val else "(no text)", language=None)
                 else:
                     st.markdown(f"**{k}**")
