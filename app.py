@@ -74,6 +74,8 @@ def postprocess_tweet(t: str) -> str:
     # 短すぎ対策：最低ラインを維持（ただし意図的短文があるので軽い補正）
     if len(t) < 55:
         pass
+    
+    return t  # 戻り値を明示的に返す（None を返さないように）
 
 def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
     prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
@@ -98,7 +100,9 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
         out = []
         for x in arr:
             s = postprocess_tweet(str(x))
-            out.append(s)
+            # None や空文字列を除外
+            if s and isinstance(s, str) and s.strip():
+                out.append(s)
         return out
     except RuntimeError as e:
         # API key expired, rate limit exceeded などのエラー時
@@ -118,9 +122,9 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
 
 def build_candidates(rows, w, role, texts):
     cands = []
-    st.write("DEBUG", role, "texts len =", len(texts), "sample =", repr(texts[:3]))
     for t in texts:
-        if not isinstance(t, str) or not t.strip():
+        # None や空文字列、非文字列を安全に除外
+        if not t or not isinstance(t, str) or not t.strip():
             continue
         saf = safety_score_01(t)
         nov = novelty_score(t, rows, window=300)
@@ -292,24 +296,50 @@ with tab1:
 
         def show_role(role, title):
             st.markdown(f"## {title}")
-            cands = pack.get(role, [])[:10]
+            raw_cands = pack.get(role, [])
+            # None や非リストを安全に処理
+            if not raw_cands or not isinstance(raw_cands, list):
+                st.info(f"{title}: 候補がありません")
+                return
+            
+            # None や非 dict の要素を除外
+            cands = [c for c in raw_cands[:10] if c and isinstance(c, dict)]
+            
+            if not cands:
+                st.info(f"{title}: 有効な候補がありません")
+                return
+            
             for i, c in enumerate(cands, start=1):
+                # text を安全に取得
                 t = c.get("text") if isinstance(c, dict) else None
-                preview = (t or "(no text)").replace("\n"," ")[:30]
+                if not t or not isinstance(t, str):
+                    t = "(no text)"
+                preview = t.replace("\n", " ")[:30]
 
-                with st.expander(f"#{i} league={c.get('league',0):.3f} pseudo={c.get('pseudo',0):.3f} {preview}..."):
-                    st.write(t or "")
-                    st.write(c["text"])
+                # 数値を安全に取得（デフォルト値付き）
+                league_val = c.get("league", 0.0)
+                pseudo_val = c.get("pseudo", 0.0)
+                if not isinstance(league_val, (int, float)):
+                    league_val = 0.0
+                if not isinstance(pseudo_val, (int, float)):
+                    pseudo_val = 0.0
+
+                with st.expander(f"#{i} league={league_val:.3f} pseudo={pseudo_val:.3f} {preview}..."):
+                    st.write(t)
+                    # 安全に dict の値を取得
+                    safety_val = c.get("safety", 0.0)
+                    novelty_val = c.get("novelty", 0.0)
+                    tail_val = c.get("tail", 0.0)
                     st.write({
-                        "safety": c["safety"],
-                        "novelty": round(c["novelty"], 3),
-                        "tail": round(c["tail"], 3),
-                        "pseudo": round(c["pseudo"], 3),
-                        "league": round(c.get("league", 0.0), 3),
+                        "safety": safety_val if isinstance(safety_val, (int, float)) else 0.0,
+                        "novelty": round(novelty_val, 3) if isinstance(novelty_val, (int, float)) else 0.0,
+                        "tail": round(tail_val, 3) if isinstance(tail_val, (int, float)) else 0.0,
+                        "pseudo": round(pseudo_val, 3),
+                        "league": round(league_val, 3),
                     })
-                    if c["safety"] <= 0.0:
+                    if isinstance(safety_val, (int, float)) and safety_val <= 0.0:
                         st.warning("Safety=0：危険判定（自動ボツ）")
-                    st.code(c["text"], language=None)
+                    st.code(t, language=None)
 
         show_role("MAIN", "朝(7-9) MAIN：本命（否定×断定）")
         show_role("SUB", "昼(12-13) SUB：準本命（否定×数字/比較）")
@@ -319,11 +349,17 @@ with tab1:
         col1, col2, col3 = st.columns(3)
 
         def pick(role, idx_key):
-            cands = pack.get(role, [])
+            raw_cands = pack.get(role, [])
+            # None や非リストを安全に処理
+            if not raw_cands or not isinstance(raw_cands, list):
+                return None
+            # None や非 dict の要素を除外
+            cands = [c for c in raw_cands if c and isinstance(c, dict)]
             if not cands:
                 return None
             idx = st.number_input(idx_key, min_value=1, max_value=min(10, len(cands)), value=1, step=1)
-            return cands[int(idx)-1]
+            selected = cands[int(idx)-1]
+            return selected if selected and isinstance(selected, dict) else None
 
         with col1:
             a_main = pick("MAIN", "MAINの採用順位(1-10)")
@@ -337,8 +373,13 @@ with tab1:
             st.session_state["approved"] = approved
             st.success("承認保存しました。②で実測入力へ。")
             for k, v in approved.items():
-                st.markdown(f"**{k}**")
-                st.code(v["text"])
+                if v and isinstance(v, dict):
+                    text_val = v.get("text", "")
+                    st.markdown(f"**{k}**")
+                    st.code(text_val if text_val else "(no text)", language=None)
+                else:
+                    st.markdown(f"**{k}**")
+                    st.info("候補が選択されていません")
 
 # =========================================================
 # ② 実測入力（手入力最小/CSV可）
