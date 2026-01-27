@@ -41,5 +41,10 @@ def gemini_json(
             return _extract_json(raw)
         except Exception as e:
             last_err = e
+            # API key expired や rate limit exceeded などのエラーを検出
+            err_str = str(e).lower()
+            if "api key" in err_str or "expired" in err_str or "rate limit" in err_str or "quota" in err_str:
+                # 呼び出し側で処理できるように、カスタム例外として再投げ
+                raise RuntimeError(f"Gemini API error: {last_err}")
             time.sleep(sleep_sec)
     raise RuntimeError(f"Gemini failed: {last_err}")

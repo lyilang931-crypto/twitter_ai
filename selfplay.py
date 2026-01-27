@@ -17,6 +17,14 @@ def league_score(cands: List[Dict[str, Any]], rounds: int = 200) -> List[Dict[st
         c["games"] = 0
 
     n = len(cands)
+    
+    # 候補数が2未満の場合は selfplay をスキップし、安全な初期値を設定
+    if n < 2:
+        for c in cands:
+            c["league"] = 0.5  # 全勝扱いではなく、中立値（0.5）を設定
+        cands.sort(key=lambda x: (x.get("league", 0.0), x.get("pseudo", 0.0)), reverse=True)
+        return cands
+    
     for _ in range(rounds):
         a, b = random.sample(range(n), 2)
         A, B = cands[a], cands[b]

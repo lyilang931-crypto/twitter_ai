@@ -84,21 +84,37 @@ def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, m
 
     rl.wait_for_rpm()
 
-    data = gemini_json(
-        prompt,
-        api_key=api_key,
-        model=model,
-        max_output_tokens=1400,
-        temperature=0.7,
-        retries=2,
-        sleep_sec=2.2,
-    )
-    arr = data.get(role, [])
-    out = []
-    for x in arr:
-        s = postprocess_tweet(str(x))
-        out.append(s)
-    return out
+    try:
+        data = gemini_json(
+            prompt,
+            api_key=api_key,
+            model=model,
+            max_output_tokens=1400,
+            temperature=0.7,
+            retries=2,
+            sleep_sec=2.2,
+        )
+        arr = data.get(role, [])
+        out = []
+        for x in arr:
+            s = postprocess_tweet(str(x))
+            out.append(s)
+        return out
+    except RuntimeError as e:
+        # API key expired, rate limit exceeded などのエラー時
+        err_msg = str(e)
+        if "api key" in err_msg.lower() or "expired" in err_msg.lower():
+            st.warning(f"⚠️ Gemini API キーが無効または期限切れです: {err_msg}")
+        elif "rate limit" in err_msg.lower() or "quota" in err_msg.lower():
+            st.warning(f"⚠️ Gemini API のレート制限に達しました: {err_msg}")
+        else:
+            st.warning(f"⚠️ Gemini API エラー: {err_msg}")
+        # 空リストを返して処理を続行（UIは落とさない）
+        return []
+    except Exception as e:
+        # その他の予期しないエラー
+        st.warning(f"⚠️ 予期しないエラーが発生しました: {str(e)}")
+        return []
 
 def build_candidates(rows, w, role, texts):
     cands = []
