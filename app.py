@@ -291,7 +291,11 @@ with tab1:
             st.markdown(f"## {title}")
             cands = pack.get(role, [])[:10]
             for i, c in enumerate(cands, start=1):
-                with st.expander(f"#{i}  league={c.get('league',0):.3f}  pseudo={c.get('pseudo',0):.3f}  {c['text'][:30]}..."):
+                t = c.get("text") if isinstance(c, dict) else None
+                preview = (t or "(no text)").replace("\n"," ")[:30]
+
+                with st.expander(f"#{i} league={c.get('league',0):.3f} pseudo={c.get('pseudo',0):.3f} {preview}..."):
+                    st.write(t or "")
                     st.write(c["text"])
                     st.write({
                         "safety": c["safety"],
