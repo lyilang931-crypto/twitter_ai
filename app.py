@@ -413,6 +413,7 @@ with tab1:
         col1, col2, col3 = st.columns(3)
 
         def pick(role, idx_key):
+            pack = st.session_state.get("pack") or {}
             raw_cands = pack.get(role, [])
             # None や非リストを安全に処理
             if not raw_cands or not isinstance(raw_cands, list):
