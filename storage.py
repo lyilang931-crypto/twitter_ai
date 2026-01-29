@@ -1,4 +1,4 @@
-# storage.py — SQLite永続化（データが消えない防御コード）
+# storage.py — 永続層（app.py が import する名前を全て提供する互換レイヤー）
 from __future__ import annotations
 
 import os
@@ -7,7 +7,9 @@ import csv
 import sqlite3
 from typing import Dict, Any, List, Optional
 
-# app.py から import される名前（必ず定義すること）
+# -----------------------------------------------------------------------------
+# app.py が from storage import する名前を全てここに列挙（ImportError ゼロ）
+# -----------------------------------------------------------------------------
 __all__ = [
     "init_db",
     "get_conn",
@@ -24,17 +26,21 @@ __all__ = [
     "save_success_template",
     "bandit_get_all",
     "bandit_update",
+    "STATUS_PINNED",
+    "STATUS_CONFIRMED",
+    "STATUS_CANDIDATE",
+    "STATUS_DELETED",
 ]
+
+# DB パス（安定パスに統一）
+DB_DIR = "data"
+DB_PATH = os.path.join(DB_DIR, "data.db")
 
 # status: candidate=候補, pinned=固定（承認済み）, confirmed=確定済み, deleted=論理削除
 STATUS_CONFIRMED = "confirmed"
 STATUS_PINNED = "pinned"
 STATUS_CANDIDATE = "candidate"
 STATUS_DELETED = "deleted"
-
-# DBは data/ 配下に固定（既存を消さない・追記のみ）
-DB_DIR = "data"
-DB_PATH = os.path.join(DB_DIR, "data.db")
 
 # 既存CSV/JSONパス（マイグレーション用）
 LOG_PATH_LEGACY = "data/twitter_log.csv"
@@ -52,15 +58,14 @@ def ensure_data_dir() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
 
 
-def init_db() -> None:
-    """起動時に1回呼ぶ。スキーマ確保＋既存CSVがあれば1回だけ移行。app.py から必須 import。"""
-    _init_db_impl()
-
-
 def get_conn() -> sqlite3.Connection:
-    """永続層への接続を返す。呼び出し側で close すること。接続方式を統一。"""
+    """永続層への接続。Streamlit 対応: check_same_thread=False, timeout=5, row_factory=Row。"""
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH, timeout=15.0)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=5,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -69,9 +74,22 @@ def _get_conn() -> sqlite3.Connection:
     return get_conn()
 
 
+def init_db() -> None:
+    """起動時1回。PRAGMA busy_timeout / WAL + CREATE TABLE IF NOT EXISTS。"""
+    conn = get_conn()
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        _ensure_schema(conn)
+        _migrate_csv_to_db_once(conn)
+        _migrate_weights_to_db_once(conn)
+        _migrate_usage_to_db_once(conn)
+    finally:
+        conn.close()
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
-    # tweets: 棋譜（論理削除 + status で状態遷移。消さずに pinned/confirmed に更新）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tweets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +118,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
-    # 列追加マイグレーション（既存DBに列がない場合のみ）
     for col_def in [
         "ALTER TABLE tweets ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))",
         "ALTER TABLE tweets ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'",
@@ -108,25 +125,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         try:
             cur.execute(col_def)
         except sqlite3.OperationalError:
-            pass  # 既に存在
-
-    # weights: 重み1件（key='default'）
+            pass
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weights (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )
     """)
-
-    # usage: 日付別API使用量
     cur.execute("""
         CREATE TABLE IF NOT EXISTS usage (
             date_key TEXT PRIMARY KEY,
             data TEXT NOT NULL
         )
     """)
-
-    # bandit: 学習加速用（arm → pulls, rewards）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bandit (
             arm_id TEXT PRIMARY KEY,
@@ -135,8 +146,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
-
-    # success_templates: 成功ツイートから抽出したテンプレ（自己蒸留用）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS success_templates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,20 +154,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
-
     conn.commit()
-
-
-def _init_db_impl() -> None:
-    """init_db の実装。スキーマ確保＋既存CSVがあれば1回だけ移行。"""
-    conn = _get_conn()
-    try:
-        _ensure_schema(conn)
-        _migrate_csv_to_db_once(conn)
-        _migrate_weights_to_db_once(conn)
-        _migrate_usage_to_db_once(conn)
-    finally:
-        conn.close()
 
 
 def _migrate_csv_to_db_once(conn: sqlite3.Connection) -> None:
@@ -167,7 +163,7 @@ def _migrate_csv_to_db_once(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM tweets")
     if cur.fetchone()[0] > 0:
-        return  # 既に移行済み
+        return
     try:
         with open(LOG_PATH_LEGACY, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -180,7 +176,6 @@ def _migrate_csv_to_db_once(conn: sqlite3.Connection) -> None:
 
 
 def _insert_tweet_row_safe(cur: sqlite3.Cursor, row: Dict[str, Any]) -> None:
-    """全列を揃えてINSERT。status は row から取り、無ければ 'confirmed'。"""
     status = str(row.get("status", STATUS_CONFIRMED))
     if status not in (STATUS_CONFIRMED, STATUS_PINNED, STATUS_CANDIDATE, STATUS_DELETED):
         status = STATUS_CONFIRMED
@@ -193,7 +188,7 @@ def _insert_tweet_row_safe(cur: sqlite3.Cursor, row: Dict[str, Any]) -> None:
 
 
 def read_rows(path: str = "", status: Optional[str] = None) -> List[Dict[str, Any]]:
-    """棋譜を取得。deleted=0 のみ。status 指定時はその status に絞る。path は互換用で無視。"""
+    """棋譜を取得。deleted=0。status 指定時はその status に絞る。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -217,7 +212,7 @@ def read_rows(path: str = "", status: Optional[str] = None) -> List[Dict[str, An
 
 
 def append_row(path: str, row: Dict[str, Any]) -> None:
-    """棋譜を1行だけ追記。上書き・全削除は行わない。トランザクションで atomic。"""
+    """棋譜を1行追記。トランザクションで atomic。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -230,8 +225,25 @@ def append_row(path: str, row: Dict[str, Any]) -> None:
         conn.close()
 
 
+def append_rows(rows: List[Dict[str, Any]]) -> None:
+    """棋譜を複数行追記。トランザクションで atomic。"""
+    if not rows:
+        return
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        for row in rows:
+            _insert_tweet_row_safe(cur, row)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def update_row(row_id: int, **kwargs: Any) -> bool:
-    """指定 id の行を更新（例: status を pinned に）。論理削除済みは更新しない。"""
+    """指定 id の行を更新（例: status を pinned に）。"""
     if not kwargs:
         return False
     conn = _get_conn()
@@ -256,25 +268,8 @@ def update_row(row_id: int, **kwargs: Any) -> bool:
         conn.close()
 
 
-def append_rows(rows: List[Dict[str, Any]]) -> None:
-    """棋譜を複数行まとめて追記（承認時の3件など）。上書き・全削除は行わない。トランザクションで atomic。"""
-    if not rows:
-        return
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        for row in rows:
-            _insert_tweet_row_safe(cur, row)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
 def logical_delete_tweet(tweet_id: Optional[int] = None, row_id: Optional[int] = None) -> bool:
-    """論理削除（状態を deleted に。行は消さない）。"""
+    """論理削除（deleted=1, status=deleted）。行は消さない。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -291,8 +286,12 @@ def logical_delete_tweet(tweet_id: Optional[int] = None, row_id: Optional[int] =
         conn.close()
 
 
+# delete_row: app.py は logical_delete_tweet を使用。互換のため alias を用意（必要なら利用可）
+delete_row = logical_delete_tweet
+
+
 def load_json(path: str, default: Dict[str, Any]) -> Dict[str, Any]:
-    """usage用。DBのusageテーブルから日付別を組み立てて返す。"""
+    """usage 用。DB の usage テーブルから日付別を返す。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -306,7 +305,7 @@ def load_json(path: str, default: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def save_json(path: str, obj: Dict[str, Any]) -> None:
-    """usage用。日付キーごとにusageテーブルへUPSERT。"""
+    """usage 用。日付キーごとに UPSERT。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -321,7 +320,7 @@ def save_json(path: str, obj: Dict[str, Any]) -> None:
 
 
 def load_weights(path: str = "") -> Dict[str, float]:
-    """重みをDBから取得。無ければ空で返し呼び出し側でデフォルト適用。"""
+    """重みを DB から取得。無ければ空 dict。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -335,7 +334,7 @@ def load_weights(path: str = "") -> Dict[str, float]:
 
 
 def save_weights(path: str, w: Dict[str, float]) -> None:
-    """重みをDBに保存（atomic）。"""
+    """重みを DB に保存。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -381,7 +380,6 @@ def _migrate_usage_to_db_once(conn: sqlite3.Connection) -> None:
         conn.rollback()
 
 
-# ---------- 成功テンプレ（自己蒸留用） ----------
 def save_success_template(template_json: str, engagement_score: float = 0.0) -> None:
     conn = _get_conn()
     try:
@@ -414,7 +412,6 @@ def get_success_templates(top_n: int = 10) -> List[Dict[str, Any]]:
         conn.close()
 
 
-# ---------- Bandit（arm → pulls, rewards） ----------
 def bandit_get_all() -> Dict[str, Dict[str, Any]]:
     conn = _get_conn()
     try:
