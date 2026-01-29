@@ -33,6 +33,7 @@ from storage import (
     bandit_get_all,
     bandit_update,
     STATUS_PINNED,
+    log_event,
 )
 from replay import sample_for_learning
 from distill import is_success_row, extract_features, to_guideline_line
@@ -402,6 +403,10 @@ with tab1:
             pass
 
         st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        try:
+            log_event("generate", payload={"topic": topic, "count": total_final}, meta={"roles": ["MAIN", "SUB", "EXP"]})
+        except Exception:
+            pass
         st.success("生成完了。上位候補を表示します。")
         
 
@@ -526,6 +531,7 @@ with tab1:
             if to_append:
                 try:
                     append_rows(to_append)
+                    log_event("pinned", payload={"roles": list(approved.keys()), "count": len(to_append)}, meta={"today": today_str})
                 except Exception as e:
                     st.warning(f"DB追記でエラー（承認は画面に保持）: {e}")
             st.success("承認保存しました（DBに記録済み）。②で実測入力へ。")
