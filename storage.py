@@ -5,8 +5,24 @@ import os
 import json
 import csv
 import sqlite3
-from datetime import date
 from typing import Dict, Any, List, Optional
+
+# app.py から import される名前（必ず定義すること）
+__all__ = [
+    "init_db",
+    "read_rows",
+    "append_row",
+    "append_rows",
+    "load_json",
+    "save_json",
+    "load_weights",
+    "save_weights",
+    "logical_delete_tweet",
+    "get_success_templates",
+    "save_success_template",
+    "bandit_get_all",
+    "bandit_update",
+]
 
 # DBは data/ 配下に固定（既存を消さない・追記のみ）
 DB_DIR = "data"
@@ -26,6 +42,11 @@ TWEETS_COLUMNS = [
 
 def ensure_data_dir() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
+
+
+def init_db() -> None:
+    """起動時に1回呼ぶ。スキーマ確保＋既存CSVがあれば1回だけ移行。app.py から必須 import。"""
+    _init_db_impl()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -110,8 +131,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def init_db() -> None:
-    """起動時に1回呼ぶ。スキーマ確保＋既存CSVがあれば1回だけ移行。"""
+def _init_db_impl() -> None:
+    """init_db の実装。スキーマ確保＋既存CSVがあれば1回だけ移行。"""
     conn = _get_conn()
     try:
         _ensure_schema(conn)
