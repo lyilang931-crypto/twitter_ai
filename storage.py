@@ -10,9 +10,11 @@ from typing import Dict, Any, List, Optional
 # app.py から import される名前（必ず定義すること）
 __all__ = [
     "init_db",
+    "get_conn",
     "read_rows",
     "append_row",
     "append_rows",
+    "update_row",
     "load_json",
     "save_json",
     "load_weights",
@@ -23,6 +25,12 @@ __all__ = [
     "bandit_get_all",
     "bandit_update",
 ]
+
+# status: candidate=候補, pinned=固定（承認済み）, confirmed=確定済み, deleted=論理削除
+STATUS_CONFIRMED = "confirmed"
+STATUS_PINNED = "pinned"
+STATUS_CANDIDATE = "candidate"
+STATUS_DELETED = "deleted"
 
 # DBは data/ 配下に固定（既存を消さない・追記のみ）
 DB_DIR = "data"
@@ -49,20 +57,26 @@ def init_db() -> None:
     _init_db_impl()
 
 
-def _get_conn() -> sqlite3.Connection:
+def get_conn() -> sqlite3.Connection:
+    """永続層への接続を返す。呼び出し側で close すること。接続方式を統一。"""
     ensure_data_dir()
     conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _get_conn() -> sqlite3.Connection:
+    return get_conn()
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
-    # tweets: 棋譜（論理削除フラグ付き）
+    # tweets: 棋譜（論理削除 + status で状態遷移。消さずに pinned/confirmed に更新）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tweets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             deleted INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'confirmed',
             date TEXT,
             role TEXT,
             tweet_id TEXT,
@@ -87,10 +101,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
     """)
     # 列追加マイグレーション（既存DBに列がない場合のみ）
-    try:
-        cur.execute("ALTER TABLE tweets ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))")
-    except sqlite3.OperationalError:
-        pass  # 既に存在
+    for col_def in [
+        "ALTER TABLE tweets ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))",
+        "ALTER TABLE tweets ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'",
+    ]:
+        try:
+            cur.execute(col_def)
+        except sqlite3.OperationalError:
+            pass  # 既に存在
 
     # weights: 重み1件（key='default'）
     cur.execute("""
@@ -162,21 +180,27 @@ def _migrate_csv_to_db_once(conn: sqlite3.Connection) -> None:
 
 
 def _insert_tweet_row_safe(cur: sqlite3.Cursor, row: Dict[str, Any]) -> None:
-    """全列を揃えてINSERT。"""
-    all_cols = ["deleted"] + TWEETS_COLUMNS
-    all_vals = [0] + [str(row.get(c, "")) for c in TWEETS_COLUMNS]
+    """全列を揃えてINSERT。status は row から取り、無ければ 'confirmed'。"""
+    status = str(row.get("status", STATUS_CONFIRMED))
+    if status not in (STATUS_CONFIRMED, STATUS_PINNED, STATUS_CANDIDATE, STATUS_DELETED):
+        status = STATUS_CONFIRMED
+    all_cols = ["deleted", "status"] + TWEETS_COLUMNS
+    all_vals = [0, status] + [str(row.get(c, "")) for c in TWEETS_COLUMNS]
     cur.execute(
         "INSERT INTO tweets (" + ",".join(all_cols) + ") VALUES (" + ",".join(["?"] * len(all_vals)) + ")",
         all_vals
     )
 
 
-def read_rows(path: str = "") -> List[Dict[str, Any]]:
-    """棋譜を取得。deleted=0 のみ。pathは互換用で無視。"""
+def read_rows(path: str = "", status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """棋譜を取得。deleted=0 のみ。status 指定時はその status に絞る。path は互換用で無視。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT * FROM tweets WHERE deleted = 0 ORDER BY id ASC")
+        if status is not None:
+            cur.execute("SELECT * FROM tweets WHERE deleted = 0 AND status = ? ORDER BY id ASC", (status,))
+        else:
+            cur.execute("SELECT * FROM tweets WHERE deleted = 0 ORDER BY id ASC")
         rows = cur.fetchall()
         out = []
         for r in rows:
@@ -184,6 +208,8 @@ def read_rows(path: str = "") -> List[Dict[str, Any]]:
             row = {k: d[k] for k in TWEETS_COLUMNS if k in d}
             if "id" in d:
                 row["id"] = d["id"]
+            if "status" in d:
+                row["status"] = d["status"]
             out.append(row)
         return out
     finally:
@@ -191,7 +217,7 @@ def read_rows(path: str = "") -> List[Dict[str, Any]]:
 
 
 def append_row(path: str, row: Dict[str, Any]) -> None:
-    """棋譜を1行だけ追記。上書き・全削除は行わない。"""
+    """棋譜を1行だけ追記。上書き・全削除は行わない。トランザクションで atomic。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -204,8 +230,34 @@ def append_row(path: str, row: Dict[str, Any]) -> None:
         conn.close()
 
 
+def update_row(row_id: int, **kwargs: Any) -> bool:
+    """指定 id の行を更新（例: status を pinned に）。論理削除済みは更新しない。"""
+    if not kwargs:
+        return False
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        set_parts = []
+        vals = []
+        for k, v in kwargs.items():
+            set_parts.append(f"{k} = ?")
+            vals.append(v)
+        vals.append(row_id)
+        cur.execute(
+            "UPDATE tweets SET " + ", ".join(set_parts) + " WHERE id = ? AND deleted = 0",
+            vals
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def append_rows(rows: List[Dict[str, Any]]) -> None:
-    """棋譜を複数行まとめて追記（承認時の3件など）。上書き・全削除は行わない。"""
+    """棋譜を複数行まとめて追記（承認時の3件など）。上書き・全削除は行わない。トランザクションで atomic。"""
     if not rows:
         return
     conn = _get_conn()
@@ -222,18 +274,19 @@ def append_rows(rows: List[Dict[str, Any]]) -> None:
 
 
 def logical_delete_tweet(tweet_id: Optional[int] = None, row_id: Optional[int] = None) -> bool:
-    """論理削除。id または row の id を指定。"""
+    """論理削除（状態を deleted に。行は消さない）。"""
     conn = _get_conn()
     try:
         cur = conn.cursor()
-        if row_id is not None:
-            cur.execute("UPDATE tweets SET deleted = 1 WHERE id = ?", (row_id,))
-        elif tweet_id is not None:
-            cur.execute("UPDATE tweets SET deleted = 1 WHERE id = ?", (tweet_id,))
-        else:
+        rid = row_id if row_id is not None else tweet_id
+        if rid is None:
             return False
+        cur.execute("UPDATE tweets SET deleted = 1, status = ? WHERE id = ? AND deleted = 0", (STATUS_DELETED, rid))
         conn.commit()
         return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

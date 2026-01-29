@@ -18,9 +18,11 @@ from weights import DEFAULT_W, sgd_update
 from selfplay import league_score
 from storage import (
     init_db,
+    get_conn,
     read_rows,
     append_row,
     append_rows,
+    update_row,
     load_json,
     save_json,
     load_weights,
@@ -30,6 +32,7 @@ from storage import (
     save_success_template,
     bandit_get_all,
     bandit_update,
+    STATUS_PINNED,
 )
 from replay import sample_for_learning
 from distill import is_success_row, extract_features, to_guideline_line
@@ -498,6 +501,7 @@ with tab1:
                 if cand and isinstance(cand, dict):
                     text_val = (cand.get("text") or "").strip()
                     to_append.append({
+                        "status": STATUS_PINNED,
                         "date": today_str,
                         "role": role_name,
                         "tweet_id": "",
