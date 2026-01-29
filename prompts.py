@@ -12,7 +12,13 @@ SAFETY_CORE = (
     "政治/宗教/差別/誹謗中傷/個人攻撃/過激煽り。"
 )
 
-def build_prompt(topic: str, trend_hint: str, n: int, role: str) -> str:
+def build_prompt(
+    topic: str,
+    trend_hint: str,
+    n: int,
+    role: str,
+    success_guidelines: str = "",
+) -> str:
     # TPM250を守るため短い。出力はJSON限定。
     # role別に“尖り方”を変える
     if role == "MAIN":
@@ -23,12 +29,14 @@ def build_prompt(topic: str, trend_hint: str, n: int, role: str) -> str:
         intent = "質問×逆説。分散狙い(上振れ)。"
 
     trend = f"トレンド: {trend_hint}" if trend_hint else "トレンド: なし"
+    extra = f"\n成功パターン（再現を推奨）: {success_guidelines}" if success_guidelines else ""
 
     return (
         f"X投稿作成。テーマ:{topic} / {trend}\n"
         f"{STYLE_CORE}\n{SAFETY_CORE}\n"
         f"制約: 1文=1ツイ。改行なし。140字以内。短すぎ禁止(目安60字以上,ただし意図的短文OK)。\n"
         f"狙い({role}): {intent}\n"
+        f"{extra}\n"
         f"JSONのみ返す。説明禁止。schema厳守:\n"
         f'{{"{role}":[ "...", "...", "..."]}}\n'
         f"{role}は{n}件。必ずJSONを閉じる。"

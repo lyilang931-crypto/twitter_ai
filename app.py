@@ -1,5 +1,7 @@
 # app.py
 from __future__ import annotations
+
+import json
 import time
 from datetime import date
 import streamlit as st
@@ -12,9 +14,26 @@ from safety import safety_score_01, safety_check
 from novelty import novelty_score
 from exp_score import tail_score, exp_utility
 from scoring import pseudo_reward_components, pseudo_score,速報_score,確定_score
-from weights import load_weights, save_weights, sgd_update
+from weights import DEFAULT_W, sgd_update
 from selfplay import league_score
-from storage import read_rows, append_row, load_json, save_json
+from storage import (
+    init_db,
+    read_rows,
+    append_row,
+    append_rows,
+    load_json,
+    save_json,
+    load_weights,
+    save_weights,
+    logical_delete_tweet,
+    get_success_templates,
+    save_success_template,
+    bandit_get_all,
+    bandit_update,
+)
+from replay import sample_for_learning
+from distill import is_success_row, extract_features, to_guideline_line
+from bandit import arm_id_from_cand, rank_candidates_by_bandit
 
 # =========================
 # 基本設定
@@ -77,8 +96,22 @@ def postprocess_tweet(t: str) -> str:
     
     return t  # 戻り値を明示的に返す（None を返さないように）
 
-def api_generate(role: str, topic: str, trend_hint: str, n: int, api_key: str, model: str) -> list[str]:
-    prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
+def api_generate(
+    role: str,
+    topic: str,
+    trend_hint: str,
+    n: int,
+    api_key: str,
+    model: str,
+    success_guidelines: str = "",
+) -> list[str]:
+    prompt = build_prompt(
+        topic=topic,
+        trend_hint=trend_hint,
+        n=n,
+        role=role,
+        success_guidelines=success_guidelines,
+    )
 
     # TPM250目安チェック（超過しそうなら短縮）
     if rough_token_count(prompt) > LIMITS.tpm:
@@ -195,11 +228,18 @@ def elo_update(r: float, score01: float, baseline: float = 0.50, k: float = 16.0
     return float(r + k * (score01 - expected))
 
 # =========================
-# Load state
+# 永続化初期化（1回だけ・既存を消さない）
+# =========================
+init_db()
+
+# =========================
+# Load state（DBから復元）
 # =========================
 rows = read_rows(LOG_PATH)
 usage = load_json(U_PATH, {})
 w = load_weights(W_PATH)
+if not w:
+    w = dict(DEFAULT_W)
 
 def last_rating(col: str, default: float = 1000.0) -> float:
     if not rows:
@@ -275,28 +315,35 @@ with tab1:
         all_sub: list[str] = []
         all_exp: list[str] = []
 
-        def gen_role(role: str, n_each: int) -> list[str]:
-            # RPMを守る
+        # 成功テンプレTopNをガイドラインとして注入（自己蒸留）
+        try:
+            templates = get_success_templates(5)
+            success_guidelines = " / ".join(
+                to_guideline_line(t.get("data", {})) for t in templates if t.get("data")
+            ) if templates else ""
+        except Exception:
+            success_guidelines = ""
+
+        def gen_role(role: str, n_each: int, s_guidelines: str = "") -> list[str]:
             rl.wait_for_rpm()
-            texts = api_generate(role, topic, trend_hint, n_each, api_key, model)
-            return texts
+            return api_generate(role, topic, trend_hint, n_each, api_key, model, success_guidelines=s_guidelines)
 
         # ===== 生成（calls_plan に応じて回す）=====
         rounds = 1 if calls_plan == 3 else 2
         for _ in range(rounds):
             # MAIN
             if usage_can_call(usage):
-                all_main.extend(gen_role("MAIN", per_role))
+                all_main.extend(gen_role("MAIN", per_role, success_guidelines))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
             # SUB
             if usage_can_call(usage):
-                all_sub.extend(gen_role("SUB", per_role))
+                all_sub.extend(gen_role("SUB", per_role, success_guidelines))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
             # EXP
             if usage_can_call(usage):
-                all_exp.extend(gen_role("EXP", per_role))
+                all_exp.extend(gen_role("EXP", per_role, success_guidelines))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
         # 重複除去
@@ -342,6 +389,14 @@ with tab1:
         main_c = league_score(main_c, rounds=200)
         sub_c  = league_score(sub_c, rounds=200)
         exp_c  = league_score(exp_c, rounds=200)
+        # Bandit で提示順位を最適化（フォロワー増を reward に学習）
+        try:
+            arms = bandit_get_all()
+            main_c = rank_candidates_by_bandit(main_c, arms)
+            sub_c  = rank_candidates_by_bandit(sub_c, arms)
+            exp_c  = rank_candidates_by_bandit(exp_c, arms)
+        except Exception:
+            pass
 
         st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
         st.success("生成完了。上位候補を表示します。")
@@ -436,7 +491,40 @@ with tab1:
         if st.button("この3つを承認して保存（投稿用に固定）"):
             approved = {"MAIN": a_main, "SUB": a_sub, "EXP": a_exp}
             st.session_state["approved"] = approved
-            st.success("承認保存しました。②で実測入力へ。")
+            # 永続化：承認した3件をDBへ追記（確定で消えない）
+            today_str = str(date.today())
+            to_append = []
+            for role_name, cand in approved.items():
+                if cand and isinstance(cand, dict):
+                    text_val = (cand.get("text") or "").strip()
+                    to_append.append({
+                        "date": today_str,
+                        "role": role_name,
+                        "tweet_id": "",
+                        "text": text_val,
+                        "impressions": "0",
+                        "likes": "0",
+                        "rts": "0",
+                        "replies": "0",
+                        "followers_before": "0",
+                        "followers_after": "0",
+                        "Pseudo": str(cand.get("pseudo", "")),
+                        "速報": "",
+                        "確定": "",
+                        "novelty": str(cand.get("novelty", "")),
+                        "safety": str(cand.get("safety", "")),
+                        "tail": str(cand.get("tail", "")),
+                        "abs_rating_before": f"{abs_rating:.2f}",
+                        "abs_rating_after": f"{abs_rating:.2f}",
+                        "rel_rating_before": f"{rel_rating:.2f}",
+                        "rel_rating_after": f"{rel_rating:.2f}",
+                    })
+            if to_append:
+                try:
+                    append_rows(to_append)
+                except Exception as e:
+                    st.warning(f"DB追記でエラー（承認は画面に保持）: {e}")
+            st.success("承認保存しました（DBに記録済み）。②で実測入力へ。")
             for k, v in approved.items():
                 if v and isinstance(v, dict):
                     text_val = v.get("text", "")
@@ -540,11 +628,28 @@ with tab2:
             "rel_rating_before": f"{rel_before:.2f}",
             "rel_rating_after": f"{rel_rating:.2f}",
         }
-        append_row(LOG_PATH, row)
-        rows = read_rows(LOG_PATH)
-
-        st.success("保存＆学習しました。次の生成から“擬似評価の精度”が上がります。")
-        st.info(f"Abs: {abs_before:.1f} → {abs_rating:.1f} / Rel: {rel_before:.1f} → {rel_rating:.1f}")
+        try:
+            append_row(LOG_PATH, row)
+            rows = read_rows(LOG_PATH)
+            # 成功ツイート自己蒸留：成功なら特徴量をテンプレに保存
+            row_for_success = {k: str(v) for k, v in row.items()}
+            if is_success_row(row_for_success):
+                try:
+                    feats = extract_features(text)
+                    save_success_template(json.dumps(feats, ensure_ascii=False), float(s確定))
+                except Exception:
+                    pass
+            # Bandit 更新（reward = 確定スコア、フォロワー増を反映済み）
+            try:
+                arm_id = arm_id_from_cand({"role": role_pick, "text": text})
+                bandit_update(arm_id, float(s確定))
+            except Exception:
+                pass
+        except Exception as e:
+            st.error(f"保存に失敗しました: {e}")
+        else:
+            st.success("保存＆学習しました。次の生成から“擬似評価の精度”が上がります。")
+            st.info(f"Abs: {abs_before:.1f} → {abs_rating:.1f} / Rel: {rel_before:.1f} → {rel_rating:.1f}")
 
     st.markdown("---")
     st.subheader("CSV一括取り込み（手入力削減）")
@@ -604,14 +709,59 @@ with tab3:
     st.write("### 学習中の重み（擬似→確定の当たり方）")
     st.json(w)
 
+    # リプレイバッファで学習強化（失敗・低評価を優先サンプル）
+    if rows and st.button("リプレイで学習強化（直近＋低評価優先で重み更新）"):
+        sampled = sample_for_learning(rows, k=50, recent_first=20)
+        learned = 0
+        for r in sampled:
+            try:
+                txt = (r.get("text") or "").strip()
+                if not txt:
+                    continue
+                nov = float(r.get("novelty") or 0)
+                saf = float(r.get("safety") or 0)
+                tail = float(r.get("tail") or 0)
+                comps = pseudo_reward_components(txt, novelty=nov, safety=saf, tail=tail)
+                y_true = float(r.get("確定") or 0)
+                ps = float(r.get("Pseudo") or 0)
+                w = sgd_update(w, comps, y_true=y_true, y_pred=ps, lr=0.2, l2=0.0005)
+                learned += 1
+            except Exception:
+                continue
+        if learned > 0:
+            save_weights(W_PATH, w)
+            st.success(f"リプレイ学習: {learned}件で重みを更新しました。")
+        else:
+            st.info("学習対象がありませんでした。")
+
     if rows:
         df = pd.DataFrame(rows)
         for c in ["Pseudo","速報","確定","novelty","tail","abs_rating_after","rel_rating_after"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         st.write("### 最近の棋譜（30件）")
-        st.dataframe(df.tail(30), use_container_width=True)
-
+        recent = df.tail(30)
+        st.dataframe(recent, use_container_width=True)
+        # 論理削除：誤入力した行を取り消し
+        if "id" in df.columns:
+            st.caption("誤入力した行は下の「取り消し」で論理削除できます。")
+            ids_in_recent = [(r.get("id"), r.get("text", "")) for _, r in recent.iterrows() if r.get("id") is not None]
+            to_delete = st.selectbox(
+                "取り消す行（ID=行番号）",
+                options=["(選択しない)"] + [f"id={rid} | {str(txt)[:40]}..." for rid, txt in ids_in_recent],
+                index=0,
+                key="delete_row_select",
+            )
+            if to_delete != "(選択しない)" and st.button("この行を取り消す（論理削除）"):
+                try:
+                    rid = int(to_delete.split("|")[0].replace("id=", "").strip())
+                    if logical_delete_tweet(row_id=rid):
+                        st.success("取り消しました。")
+                        st.rerun()
+                    else:
+                        st.warning("取り消しに失敗しました。")
+                except Exception as e:
+                    st.error(f"取り消しエラー: {e}")
         st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")
     else:
-        st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。") # selfplay.py
+        st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。")
