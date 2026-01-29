@@ -302,7 +302,7 @@ tab1, tab2, tab3 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 
 # =========================================================
 with tab1:
     st.subheader("今日のテーマ（あなたっぽさ：冷酷×設計×起業×経済）")
-    topic = st.text_input("テーマ", value="起業で失敗する人の共通点（努力ではなく設計の問題）")
+    topic = st.text_input("テーマ", value="起業で失敗する人の共通点")
 
     if st.button("生成（制限回避）→ 内部自己対局 → 上位を提示"):
         if not usage_can_call(usage):
