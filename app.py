@@ -12,9 +12,31 @@ from safety import safety_score_01, safety_check
 from novelty import novelty_score
 from exp_score import tail_score, exp_utility
 from scoring import pseudo_reward_components, pseudo_score,速報_score,確定_score
-from weights import load_weights, save_weights, sgd_update
+from weights import load_weights, save_weights, sgd_update, sgd_update_with_gate, IMPRESSION_GATE
 from selfplay import league_score
-from storage import read_rows, append_row, load_json, save_json
+from storage import (
+    read_rows,
+    append_row,
+    load_json,
+    save_json,
+    atomic_save_json,
+    atomic_append_row,
+    atomic_load_json,
+    USE_SQLITE,
+    init_schema,
+    db_read_logs,
+    db_append_log,
+    db_save_approved,
+    db_load_approved,
+    db_save_pack,
+    db_load_pack,
+    db_save_weights,
+    db_load_weights,
+    db_save_usage,
+    db_load_usage,
+    db_save_rating,
+    db_load_rating,
+)
 
 # =========================
 # 基本設定
@@ -23,11 +45,13 @@ st.set_page_config(page_title="TwitterAI", layout="wide")
 st.title("Twitter自動化/ 超高速学習")
 
 # =========================
-# Paths
+# Paths（永続化: DB または 原子書き込みファイル）
 # =========================
 LOG_PATH = "data/twitter_log.csv"
 W_PATH = "data/weights.json"
 U_PATH = "data/usage.json"
+PACK_PATH = "data/last_pack.json"
+APPROVED_PATH = "data/approved.json"
 
 # =========================
 # Limits（ユーザー指定）
@@ -194,23 +218,73 @@ def elo_update(r: float, score01: float, baseline: float = 0.50, k: float = 16.0
     expected = baseline
     return float(r + k * (score01 - expected))
 
-# =========================
-# Load state
-# =========================
-rows = read_rows(LOG_PATH)
-usage = load_json(U_PATH, {})
-w = load_weights(W_PATH)
 
-def last_rating(col: str, default: float = 1000.0) -> float:
-    if not rows:
+def _replay_weights(rows_list, w, max_replay: int = 10) -> dict:
+    """直近棋譜から experience replay で重みをまとめて更新（軽量）。"""
+    for r in (rows_list[-max_replay:] if len(rows_list) > max_replay else rows_list):
+        txt = (r.get("text") or "").strip()
+        if not txt:
+            continue
+        try:
+            y_true = float(r.get("確定", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        saf = safety_score_01(txt)
+        nov = novelty_score(txt, rows_list, window=300)
+        tail = tail_score(txt)
+        comps = pseudo_reward_components(txt, novelty=nov, safety=saf, tail=tail)
+        ps = pseudo_score(comps, w)
+        impr = int(r.get("impressions", 0) or 0)
+        w, _ = sgd_update_with_gate(w, comps, y_true, ps, impr, lr=0.25, l2=0.0005)
+    return w
+
+# =========================
+# Load state（永続化を正とする: DB または 原子ファイル）
+# =========================
+def last_rating_from_rows(rows_list, col: str, default: float = 1000.0) -> float:
+    if not rows_list:
         return default
     try:
-        return float(rows[-1].get(col, default) or default)
+        return float(rows_list[-1].get(col, default) or default)
     except Exception:
         return default
 
-abs_rating = last_rating("abs_rating_after", 1000.0)
-rel_rating = last_rating("rel_rating_after", 1000.0)
+if USE_SQLITE:
+    try:
+        init_schema()
+        rows = db_read_logs()
+        usage = db_load_usage() or load_json(U_PATH, {})
+        w = db_load_weights() or load_weights(W_PATH)
+        _pack_from_storage = db_load_pack()
+        _approved_from_storage = db_load_approved()
+        if rows:
+            abs_rating = last_rating_from_rows(rows, "abs_rating_after", 1000.0)
+            rel_rating = last_rating_from_rows(rows, "rel_rating_after", 1000.0)
+        else:
+            abs_rating, rel_rating = db_load_rating()
+    except Exception:
+        rows = read_rows(LOG_PATH)
+        usage = load_json(U_PATH, {})
+        w = load_weights(W_PATH)
+        abs_rating = last_rating_from_rows(rows, "abs_rating_after", 1000.0)
+        rel_rating = last_rating_from_rows(rows, "rel_rating_after", 1000.0)
+        _pack_from_storage = atomic_load_json(PACK_PATH, {})
+        _approved_from_storage = atomic_load_json(APPROVED_PATH, {})
+else:
+    rows = read_rows(LOG_PATH)
+    usage = load_json(U_PATH, {})
+    w = load_weights(W_PATH)
+    abs_rating = last_rating_from_rows(rows, "abs_rating_after", 1000.0)
+    rel_rating = last_rating_from_rows(rows, "rel_rating_after", 1000.0)
+    _pack_from_storage = atomic_load_json(PACK_PATH, {})
+    _approved_from_storage = atomic_load_json(APPROVED_PATH, {})
+
+def last_rating(col: str, default: float = 1000.0) -> float:
+    return last_rating_from_rows(rows, col, default)
+
+# 表示用: session_state があれば優先（直後生成/承認）、なければ永続化から復元
+pack = st.session_state.get("pack") or _pack_from_storage
+approved_persisted = st.session_state.get("approved") or _approved_from_storage
 
 # =========================
 # Sidebar
@@ -287,17 +361,38 @@ with tab1:
             # MAIN
             if usage_can_call(usage):
                 all_main.extend(gen_role("MAIN", per_role))
-                usage_inc(usage, 1); save_json(U_PATH, usage)
+                usage_inc(usage, 1)
+                try:
+                    if USE_SQLITE:
+                        db_save_usage(usage)
+                    else:
+                        atomic_save_json(U_PATH, usage)
+                except Exception:
+                    save_json(U_PATH, usage)
 
             # SUB
             if usage_can_call(usage):
                 all_sub.extend(gen_role("SUB", per_role))
-                usage_inc(usage, 1); save_json(U_PATH, usage)
+                usage_inc(usage, 1)
+                try:
+                    if USE_SQLITE:
+                        db_save_usage(usage)
+                    else:
+                        atomic_save_json(U_PATH, usage)
+                except Exception:
+                    save_json(U_PATH, usage)
 
             # EXP
             if usage_can_call(usage):
                 all_exp.extend(gen_role("EXP", per_role))
-                usage_inc(usage, 1); save_json(U_PATH, usage)
+                usage_inc(usage, 1)
+                try:
+                    if USE_SQLITE:
+                        db_save_usage(usage)
+                    else:
+                        atomic_save_json(U_PATH, usage)
+                except Exception:
+                    save_json(U_PATH, usage)
 
         # 重複除去
         def uniq(xs: list[str]) -> list[str]:
@@ -343,11 +438,18 @@ with tab1:
         sub_c  = league_score(sub_c, rounds=200)
         exp_c  = league_score(exp_c, rounds=200)
 
-        st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        pack_new = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        st.session_state["pack"] = pack_new
+        try:
+            if USE_SQLITE:
+                db_save_pack(pack_new)
+            else:
+                atomic_save_json(PACK_PATH, pack_new)
+        except Exception as e:
+            st.warning(f"候補の永続化に失敗しました（表示は継続）: {type(e).__name__}")
         st.success("生成完了。上位候補を表示します。")
-        
 
-    pack = st.session_state.get("pack")
+    pack = st.session_state.get("pack") or _pack_from_storage
     if pack:
         st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。警告付き候補（政治/経済など）も表示されます。")
 
@@ -436,6 +538,16 @@ with tab1:
         if st.button("この3つを承認して保存（投稿用に固定）"):
             approved = {"MAIN": a_main, "SUB": a_sub, "EXP": a_exp}
             st.session_state["approved"] = approved
+            try:
+                if USE_SQLITE:
+                    db_save_approved(approved)
+                else:
+                    atomic_save_json(APPROVED_PATH, approved)
+                n_approved = sum(1 for v in approved.values() if v and isinstance(v, dict))
+                st.info(f"保存先: {'DB approved' if USE_SQLITE else APPROVED_PATH}, 件数: {n_approved}（候補・棋譜は消えません）")
+            except Exception as e:
+                st.error("承認の保存に失敗しました。")
+                st.caption(str(type(e).__name__))
             st.success("承認保存しました。②で実測入力へ。")
             for k, v in approved.items():
                 if v and isinstance(v, dict):
@@ -455,7 +567,7 @@ with tab1:
 # =========================================================
 with tab2:
     st.subheader("実測入力：速報→確定（手入力最小）")
-    approved = st.session_state.get("approved", {})
+    approved = approved_persisted
 
     role_pick = st.selectbox("対象（役割）", ["MAIN","SUB","EXP"], index=0)
     default_text = (approved.get(role_pick) or {}).get("text", "")
@@ -498,25 +610,18 @@ with tab2:
     })
 
     if st.button("保存（棋譜に追加）＋ 重み学習（擬似↔確定ズレ）＋ レート更新"):
-
-        # 学習：擬似→確定のズレで重み更新
         y_true = float(s確定)
-        y_pred = float(ps)
-        w = sgd_update(w, comps, y_true=y_true, y_pred=y_pred, lr=0.35, l2=0.0005)
-        save_weights(W_PATH, w)
-
-        # レート更新（絶対/相対）
         abs_before = abs_rating
         rel_before = rel_rating
 
-        abs_rating = elo_update(abs_rating, score01=y_true, baseline=float(baseline), k=float(k_abs))
-        # 相対：自分の最近平均（簡易）
+        # レート更新（絶対/相対）
+        abs_rating_new = elo_update(abs_rating, score01=y_true, baseline=float(baseline), k=float(k_abs))
         tail_rows = rows[-30:] if len(rows) > 30 else rows
         if tail_rows:
             recent_mean = sum(float(r.get("確定", 0) or 0) for r in tail_rows) / max(1, len(tail_rows))
         else:
             recent_mean = 0.50
-        rel_rating = elo_update(rel_rating, score01=y_true, baseline=float(recent_mean), k=float(k_rel))
+        rel_rating_new = elo_update(rel_rating, score01=y_true, baseline=float(recent_mean), k=float(k_rel))
 
         row = {
             "date": str(date.today()),
@@ -536,15 +641,47 @@ with tab2:
             "safety": f"{saf:.0f}",
             "tail": f"{tail:.6f}",
             "abs_rating_before": f"{abs_before:.2f}",
-            "abs_rating_after": f"{abs_rating:.2f}",
+            "abs_rating_after": f"{abs_rating_new:.2f}",
             "rel_rating_before": f"{rel_before:.2f}",
-            "rel_rating_after": f"{rel_rating:.2f}",
+            "rel_rating_after": f"{rel_rating_new:.2f}",
         }
-        append_row(LOG_PATH, row)
-        rows = read_rows(LOG_PATH)
+        try:
+            if USE_SQLITE:
+                db_append_log(row)
+                rows_new = db_read_logs()
+                db_save_rating(abs_rating_new, rel_rating_new)
+            else:
+                atomic_append_row(LOG_PATH, row)
+                rows_new = read_rows(LOG_PATH)
+        except Exception as e:
+            st.error("棋譜の保存に失敗しました。")
+            st.caption(str(type(e).__name__))
+            rows_new = rows
+
+        # 学習：インプレゲート付き（impressions < 200 は重み更新しない）+ clip
+        w_new, updated = sgd_update_with_gate(w, comps, y_true, float(ps), int(impr), lr=0.35, l2=0.0005)
+        if updated:
+            w = w_new
+        # Experience replay: 直近10件で重みを追加更新
+        w = _replay_weights(rows_new, w, max_replay=10)
+        try:
+            if USE_SQLITE:
+                db_save_weights(w)
+            else:
+                save_weights(W_PATH, w)
+        except Exception:
+            pass
+
+        # グローバル状態を更新（rerun 後も永続化から読むが、同一 run 内の表示を即反映）
+        rows.clear()
+        rows.extend(rows_new)
+        abs_rating = abs_rating_new
+        rel_rating = rel_rating_new
 
         st.success("保存＆学習しました。次の生成から“擬似評価の精度”が上がります。")
         st.info(f"Abs: {abs_before:.1f} → {abs_rating:.1f} / Rel: {rel_before:.1f} → {rel_rating:.1f}")
+        n_recent = len(rows_new)
+        st.caption(f"保存先: {'DB logs' if USE_SQLITE else LOG_PATH}, 直近件数: {n_recent}（インプレ{IMPRESSION_GATE}未満は重み更新スキップ）")
 
     st.markdown("---")
     st.subheader("CSV一括取り込み（手入力削減）")
