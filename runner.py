@@ -46,7 +46,7 @@ def generate_candidates(role: str, topic: str, trend_hint: str, n: int, api_key:
     """
     candidates: List[Dict[str, Any]] = []
     for i in range(n):
-        prompt = build_prompt(topic=topic, trend_hint=trend_hint, role=role)
+        prompt = build_prompt(topic=topic, trend_hint=trend_hint, n=n, role=role)
 
         # レート制限（あなたの RateLimiter API に合わせる）
         # 例: rl.wait_for_rpm() があるならそれを使う

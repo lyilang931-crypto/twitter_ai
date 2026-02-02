@@ -81,6 +81,7 @@ def usage_inc(usage: dict, n: int = 1) -> dict:
     return usage
 
 def postprocess_tweet(t: str) -> str:
+    """本文を正規化。固有名詞は削除しない（名前を壊さない）。"""
     t = (t or "").strip()
     t = t.replace("\n", " ")
     # 二重引用を雑に除去
@@ -100,6 +101,52 @@ def postprocess_tweet(t: str) -> str:
     
     return t  # 戻り値を明示的に返す（None を返さないように）
 
+
+def extract_name_candidates(topic: str) -> list[str]:
+    """テーマから固有名詞の候補を抽出（本文含有チェック用）。"""
+    t = (topic or "").strip()
+    if not t:
+        return []
+    candidates = [t]
+    for sep in ["・", " ", "　", "、"]:
+        if sep in t:
+            for part in t.split(sep):
+                p = part.strip()
+                if len(p) >= 2:
+                    candidates.append(p)
+    return list(dict.fromkeys(candidates))
+
+
+def contains_name(text: str, topic: str) -> bool:
+    """本文にテーマの固有名詞（またはその一部）が含まれるか。"""
+    if not text or not topic:
+        return False
+    for cand in extract_name_candidates(topic):
+        if cand and cand in text:
+            return True
+    return False
+
+
+def any_tweet_contains_name(texts: list[str], topic: str) -> bool:
+    """いずれか1ツイート以上にテーマの名前が含まれるか。"""
+    return any(contains_name(t, topic) for t in (texts or []))
+
+
+def is_named_entity_required(topic: str) -> bool:
+    """テーマが人物名っぽいか（短く、文節接続が少ない）。"""
+    t = (topic or "").strip()
+    if len(t) > 25:
+        return False
+    particles = ("で", "の", "と", "を", "が", "は", "に", "について", "共通点", "考え")
+    return not any(p in t for p in particles)
+
+
+def fallback_tweet_with_name(topic: str) -> str:
+    """名前入り汎用ツイ（API追加呼び出しなし）。観察・学びスタイル。"""
+    t = (topic or "").strip() or "テーマ"
+    return f"{t}についての観察。設計と行動を大切にしたい。"
+
+
 def api_generate(
     role: str,
     topic: str,
@@ -108,6 +155,7 @@ def api_generate(
     api_key: str,
     model: str,
     success_guidelines: str = "",
+    named_entity_required: bool = False,
 ) -> list[str]:
     prompt = build_prompt(
         topic=topic,
@@ -115,6 +163,7 @@ def api_generate(
         n=n,
         role=role,
         success_guidelines=success_guidelines,
+        named_entity_required=named_entity_required,
     )
 
     # TPM250目安チェック（超過しそうなら短縮）
@@ -328,27 +377,44 @@ with tab1:
         except Exception:
             success_guidelines = ""
 
-        def gen_role(role: str, n_each: int, s_guidelines: str = "") -> list[str]:
+        named_entity_required = is_named_entity_required(topic)
+
+        def gen_role(role: str, n_each: int, s_guidelines: str = "", name_required: bool = False) -> list[str]:
             rl.wait_for_rpm()
-            return api_generate(role, topic, trend_hint, n_each, api_key, model, success_guidelines=s_guidelines)
+            return api_generate(
+                role, topic, trend_hint, n_each, api_key, model,
+                success_guidelines=s_guidelines,
+                named_entity_required=name_required,
+            )
 
         # ===== 生成（calls_plan に応じて回す）=====
         rounds = 1 if calls_plan == 3 else 2
         for _ in range(rounds):
             # MAIN
             if usage_can_call(usage):
-                all_main.extend(gen_role("MAIN", per_role, success_guidelines))
+                all_main.extend(gen_role("MAIN", per_role, success_guidelines, named_entity_required))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
             # SUB
             if usage_can_call(usage):
-                all_sub.extend(gen_role("SUB", per_role, success_guidelines))
+                all_sub.extend(gen_role("SUB", per_role, success_guidelines, named_entity_required))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
             # EXP
             if usage_can_call(usage):
-                all_exp.extend(gen_role("EXP", per_role, success_guidelines))
+                all_exp.extend(gen_role("EXP", per_role, success_guidelines, named_entity_required))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
+
+        # 固有名詞必須: 条件未達なら1回だけ MAIN を再生成
+        if named_entity_required and not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
+            if usage_can_call(usage):
+                retry_main = gen_role("MAIN", per_role, success_guidelines, True)
+                all_main.extend(retry_main)
+                usage_inc(usage, 1); save_json(U_PATH, usage)
+            # それでもダメなら汎用ツイにフォールバック（API追加呼び出し無し）
+            if not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
+                fallback = fallback_tweet_with_name(topic)
+                all_main.insert(0, fallback)
 
         # 重複除去
         def uniq(xs: list[str]) -> list[str]:
