@@ -23,7 +23,6 @@ from storage import (
     append_row,
     append_rows,
     update_row,
-    update_by_id,
     load_json,
     save_json,
     load_weights,
@@ -36,6 +35,10 @@ from storage import (
     STATUS_PINNED,
     log_event,
 )
+try:
+    from storage import update_by_id
+except ImportError:
+    update_by_id = None  # 編集機能は未反映時もアプリは起動させる
 from replay import sample_for_learning
 from distill import is_success_row, extract_features, to_guideline_line
 from bandit import arm_id_from_cand, rank_candidates_by_bandit
@@ -932,22 +935,25 @@ with tab3:
                                 edit_fol_a = st.number_input("フォロワー（後）", min_value=0, value=_safe_int(row_to_edit.get("followers_after")), step=1, key="edit_fol_a")
                             edit_tweet_id = st.text_input("tweet_id（任意）", value=(row_to_edit.get("tweet_id") or ""), key="edit_tweet_id")
                             if st.form_submit_button("保存して反映"):
-                                patch = {
-                                    "text": edit_text,
-                                    "role": edit_role,
-                                    "impressions": edit_impr,
-                                    "likes": edit_likes,
-                                    "rts": edit_rts,
-                                    "replies": edit_replies,
-                                    "followers_before": edit_fol_b,
-                                    "followers_after": edit_fol_a,
-                                    "tweet_id": edit_tweet_id,
-                                }
-                                if update_by_id(rid, patch):
-                                    st.success("更新しました。")
-                                    st.rerun()
+                                if update_by_id is None:
+                                    st.error("編集機能は利用できません。storage.update_by_id がインポートされていません。")
                                 else:
-                                    st.warning("更新に失敗しました。")
+                                    patch = {
+                                        "text": edit_text,
+                                        "role": edit_role,
+                                        "impressions": edit_impr,
+                                        "likes": edit_likes,
+                                        "rts": edit_rts,
+                                        "replies": edit_replies,
+                                        "followers_before": edit_fol_b,
+                                        "followers_after": edit_fol_a,
+                                        "tweet_id": edit_tweet_id,
+                                    }
+                                    if update_by_id(rid, patch):
+                                        st.success("更新しました。")
+                                        st.rerun()
+                                    else:
+                                        st.warning("更新に失敗しました。")
                 except Exception as e:
                     st.error(f"編集エラー: {e}")
         st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")

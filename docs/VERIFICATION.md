@@ -80,3 +80,38 @@
 
 - `secrets.toml` / `.env*` / APIキー・パスワードは読まない・触らない・表示しない方針で変更。
 - 政治テーマでも、断定ではなく「観察・問い・設計」に寄せつつ、**キーワード自体は本文に残す**ようにプロンプトとフォールバックで制御している。
+
+---
+
+## ImportError `update_by_id` 復旧（Streamlit Cloud 等）
+
+### 事象
+
+- 起動時に `ImportError: cannot import name 'update_by_id' from storage` で落ちる。
+
+### 対応内容
+
+1. **まず起動させる**  
+   - `app.py` で `update_by_id` を `try/except` で import。失敗時は `update_by_id = None` とし、編集以外の機能はそのまま利用可能。
+2. **編集時のガード**  
+   - 編集フォームで「保存して反映」時に `update_by_id is None` なら `st.error` を表示して更新処理は行わない。
+3. **本修正**  
+   - `storage.py` に `update_by_id(row_id, patch)` を実装し、`__all__` に含める。同一リポジトリ内の `storage.py` に既に実装済みであれば、デプロイ対象に含まれるようにする。
+
+### ローカル確認コマンド
+
+```bash
+python -m py_compile app.py storage.py
+streamlit run app.py
+```
+
+- 起動後: タブ③で棋譜を1行編集 → 「保存して反映」→ 再読み込みで編集が残ること。
+
+### Streamlit Cloud で反映されない場合のチェック
+
+- **ブランチ**  
+  - Cloud のデプロイ元ブランチが、`update_by_id` を追加したコミットを含むブランチになっているか確認。
+- **キャッシュ**  
+  - Streamlit Cloud の「Clear cache」や「Reboot app」を実行してから再デプロイ。
+- **storage.py の存在**  
+  - デプロイに含まれるファイルに `storage.py` が含まれ、`update_by_id` と `TWEETS_EDITABLE_COLUMNS` が定義されているか確認。
