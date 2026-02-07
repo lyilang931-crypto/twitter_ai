@@ -6,6 +6,8 @@ STYLE_CORE = (
     "口調: 短文/構造/冷酷に真実。努力より設計。最後は行動1つ or 問い。"
     "余計な絵文字/前置き/箇条書き/番号禁止。"
 )
+# 語彙多様性: 直近で多用した語は避け、同義語・言い換えで多様に
+STYLE_DIVERSITY = "直近で多用した語は避け、同義語・言い換えで多様に。"
 
 # 炎上・名誉毀損回避: 断定や事実主張は避け、観察・学び・自分への適用として書く
 STYLE_SAFE = (
@@ -26,6 +28,7 @@ def build_prompt(
     success_guidelines: str = "",
     named_entity_required: bool = False,
     required_keywords: List[str] = None,
+    diversity_hint: str = "",
 ) -> str:
     # TPM250を守るため短い。出力はJSON限定。
     # role別に“尖り方”を変える
@@ -52,13 +55,14 @@ def build_prompt(
     if required_keywords:
         kw_list = " / ".join(required_keywords[:5])
         kw_rule = f"\n【必須】以下のキーワードのいずれかを、3ツイートのうち最低1件の本文に必ず含めること（観察・問い・設計の文でよい）: {kw_list}"
+    diversity_rule = f"\n{diversity_hint}" if diversity_hint else ""
 
     return (
         f"X投稿作成。テーマ:{topic} / {trend}\n"
-        f"{STYLE_CORE}\n{STYLE_SAFE}\n{SAFETY_CORE}\n"
+        f"{STYLE_CORE}\n{STYLE_SAFE}\n{STYLE_DIVERSITY}\n{SAFETY_CORE}\n"
         f"制約: 1文=1ツイ。改行なし。140字以内。短すぎ禁止(目安60字以上,ただし意図的短文OK)。\n"
         f"狙い({role}): {intent}\n"
-        f"{name_rule}{kw_rule}{extra}\n"
+        f"{name_rule}{kw_rule}{diversity_rule}{extra}\n"
         f"JSONのみ返す。説明禁止。schema厳守:\n"
         f'{{"{role}":[ "...", "...", "..."]}}\n'
         f"{role}は{n}件。必ずJSONを閉じる。"

@@ -42,6 +42,12 @@ except ImportError:
 from replay import sample_for_learning
 from distill import is_success_row, extract_features, to_guideline_line
 from bandit import arm_id_from_cand, rank_candidates_by_bandit
+from vocabulary_diversity import (
+    recent_word_frequency,
+    get_overused_words,
+    vocab_diversity_penalty,
+    format_synonym_hint,
+)
 
 # =========================
 # 基本設定
@@ -200,6 +206,7 @@ def api_generate(
     success_guidelines: str = "",
     named_entity_required: bool = False,
     required_keywords: list[str] = None,
+    diversity_hint: str = "",
 ) -> list[str]:
     if required_keywords is None:
         required_keywords = []
@@ -211,6 +218,7 @@ def api_generate(
         success_guidelines=success_guidelines,
         named_entity_required=named_entity_required,
         required_keywords=required_keywords,
+        diversity_hint=diversity_hint,
     )
 
     # TPM250目安チェック（超過しそうなら短縮）
@@ -260,12 +268,18 @@ def build_candidates(rows, w, role, texts):
     """
     候補を構築。textがNone/emptyは除外。
     safety<=0でも、明確に危険でない限りflaggedフラグを付けて保持。
+    語彙多様性: 直近で過多になった語を含む候補にはペナルティを付与（減点のみ、禁止ではない）。
     """
     cands = []
     empty_text_dropped = 0
     safety_dropped_count = 0
     safety_flagged_count = 0
-    
+
+    # 直近N件で語彙頻度を算出（ペナルティ用）
+    recent_n = 15
+    recent_rows = (rows or [])[-20:] if (rows or []) else []
+    freq_map = recent_word_frequency(recent_rows, n=recent_n) if recent_rows else {}
+
     for t in texts:
         # None や空文字列、非文字列を安全に除外
         if not t or not isinstance(t, str) or not t.strip():
@@ -296,6 +310,10 @@ def build_candidates(rows, w, role, texts):
         # EXPは分散最大化を上乗せ（“上振れ確率”）
         if role == "EXP":
             ps = 0.35 * ps + 0.65 * exp_utility(tail=tail, novelty=nov, safety=saf)
+
+        # 語彙多様性: 直近で過多の語を含む場合は軽く減点（連呼抑制、完全禁止ではない）
+        penalty = vocab_diversity_penalty(t, freq_map, threshold=3, penalty_per_word=0.08, cap=0.25)
+        ps = max(0.0, ps - penalty)
 
         cands.append({
             "role": role,
@@ -426,6 +444,11 @@ with tab1:
 
         named_entity_required = is_named_entity_required(topic)
         required_keywords = collect_required_keywords(topic, trend_hint)
+        # 語彙多様性: 直近で過多の語があればプロンプトに言い換え推奨を注入
+        _recent = (rows or [])[-20:]
+        _freq = recent_word_frequency(_recent, n=15) if _recent else {}
+        _overused = get_overused_words(_freq, threshold=3)
+        diversity_hint = format_synonym_hint(_overused)
 
         def gen_role(
             role: str,
@@ -440,6 +463,7 @@ with tab1:
                 success_guidelines=s_guidelines,
                 named_entity_required=name_required,
                 required_keywords=req_kw or [],
+                diversity_hint=diversity_hint,
             )
 
         # ===== 生成（calls_plan に応じて回す）=====
