@@ -1,4 +1,6 @@
 # storage.py — 永続層（Postgres / SQLite 切替、event_log 永続化）
+# 保存層: デフォルトは SQLite/Postgres。環境変数 SUPABASE_URL + SUPABASE_KEY が設定されている
+# 場合のみ Supabase に切替可能（storage_supabase を利用）。上書き時は必ず load→merge→save とすること。
 from __future__ import annotations
 
 import os
@@ -7,7 +9,7 @@ import csv
 import sqlite3
 from typing import Dict, Any, List, Optional, Union
 
-# DATABASE_URL: st.secrets または環境変数。あれば Postgres、なければ SQLite
+# DATABASE_URL: 環境変数優先。未設定時のみ st.secrets を参照（secrets は読まない方針のため env 推奨）
 _database_url = os.environ.get("DATABASE_URL", "")
 if not _database_url:
     try:
@@ -37,6 +39,13 @@ def _row_to_dict(cur, r) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # app.py が from storage import する名前を全てここに列挙（ImportError ゼロ）
 # -----------------------------------------------------------------------------
+# 編集可能な列（update_by_id で許可）
+TWEETS_EDITABLE_COLUMNS = [
+    "date", "role", "tweet_id", "text", "impressions", "likes", "rts", "replies",
+    "followers_before", "followers_after", "Pseudo", "速報", "確定", "novelty", "safety", "tail",
+    "abs_rating_before", "abs_rating_after", "rel_rating_before", "rel_rating_after",
+]
+
 __all__ = [
     "init_db",
     "get_conn",
@@ -44,6 +53,7 @@ __all__ = [
     "append_row",
     "append_rows",
     "update_row",
+    "update_by_id",
     "load_json",
     "save_json",
     "load_weights",
@@ -421,6 +431,20 @@ def update_row(row_id: int, **kwargs: Any) -> bool:
         raise
     finally:
         conn.close()
+
+
+def update_by_id(row_id: int, patch: Dict[str, Any]) -> bool:
+    """指定 id の行を patch のキーで更新。許可列のみ反映し永続保存。"""
+    if not patch or row_id is None:
+        return False
+    allowed = {k: v for k, v in patch.items() if k in TWEETS_EDITABLE_COLUMNS}
+    if not allowed:
+        return False
+    # 数値列は文字列で保存されているため str に統一
+    for col in ["impressions", "likes", "rts", "replies", "followers_before", "followers_after"]:
+        if col in allowed and allowed[col] is not None:
+            allowed[col] = str(allowed[col])
+    return update_row(row_id, **allowed)
 
 
 def logical_delete_tweet(tweet_id: Optional[int] = None, row_id: Optional[int] = None) -> bool:

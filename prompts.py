@@ -1,5 +1,6 @@
 # prompts.py
 from __future__ import annotations
+from typing import List
 
 STYLE_CORE = (
     "口調: 短文/構造/冷酷に真実。努力より設計。最後は行動1つ or 問い。"
@@ -24,6 +25,7 @@ def build_prompt(
     role: str,
     success_guidelines: str = "",
     named_entity_required: bool = False,
+    required_keywords: List[str] = None,
 ) -> str:
     # TPM250を守るため短い。出力はJSON限定。
     # role別に“尖り方”を変える
@@ -39,18 +41,24 @@ def build_prompt(
 
     # テーマに人物名を入れた場合: 最低1件は本文にその名前（または英語表記）を含める
     name_rule = ""
+    if required_keywords is None:
+        required_keywords = []
     if named_entity_required:
         name_rule = (
             f"\n【必須】テーマの人物名を本文に含める: "
             f"3ツイート分のうち最低1件は、本文中に「{topic}」またはその英語表記を必ず含めること。"
         )
+    kw_rule = ""
+    if required_keywords:
+        kw_list = " / ".join(required_keywords[:5])
+        kw_rule = f"\n【必須】以下のキーワードのいずれかを、3ツイートのうち最低1件の本文に必ず含めること（観察・問い・設計の文でよい）: {kw_list}"
 
     return (
         f"X投稿作成。テーマ:{topic} / {trend}\n"
         f"{STYLE_CORE}\n{STYLE_SAFE}\n{SAFETY_CORE}\n"
         f"制約: 1文=1ツイ。改行なし。140字以内。短すぎ禁止(目安60字以上,ただし意図的短文OK)。\n"
         f"狙い({role}): {intent}\n"
-        f"{name_rule}{extra}\n"
+        f"{name_rule}{kw_rule}{extra}\n"
         f"JSONのみ返す。説明禁止。schema厳守:\n"
         f'{{"{role}":[ "...", "...", "..."]}}\n'
         f"{role}は{n}件。必ずJSONを閉じる。"

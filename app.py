@@ -23,6 +23,7 @@ from storage import (
     append_row,
     append_rows,
     update_row,
+    update_by_id,
     load_json,
     save_json,
     load_weights,
@@ -147,6 +148,45 @@ def fallback_tweet_with_name(topic: str) -> str:
     return f"{t}についての観察。設計と行動を大切にしたい。"
 
 
+def collect_required_keywords(topic: str, trend_hint: str) -> list[str]:
+    """テーマとトレンドから必須キーワードを収集（重複除去・2文字以上）。"""
+    out: list[str] = []
+    t = (topic or "").strip()
+    if t and len(t) >= 2:
+        out.append(t)
+    hint = (trend_hint or "").strip()
+    if not hint:
+        return list(dict.fromkeys(out))
+    for sep in [",", " ", "　", "・", "、"]:
+        for part in hint.split(sep):
+            p = part.strip()
+            if len(p) >= 2 and p not in out:
+                out.append(p)
+    return list(dict.fromkeys(out))
+
+
+def contains_keywords(text: str, required_keywords: list[str]) -> bool:
+    """本文に必須キーワードのいずれかが含まれるか（部分一致・前後空白や記号は許容）。"""
+    if not text or not required_keywords:
+        return False
+    normalized = (text or "").strip()
+    for kw in required_keywords:
+        if kw and kw in normalized:
+            return True
+    return False
+
+
+def any_tweet_contains_keywords(texts: list[str], required_keywords: list[str]) -> bool:
+    """いずれか1ツイート以上に必須キーワードが含まれるか。"""
+    return any(contains_keywords(t, required_keywords) for t in (texts or []))
+
+
+def fallback_tweet_with_keywords(required_keywords: list[str]) -> str:
+    """必須キーワード入り汎用ツイ（API呼び出しなし）。観察・設計スタイル。"""
+    kw = (required_keywords or [""])[0].strip() or "テーマ"
+    return f"{kw}についての観察。設計と行動を大切にしたい。"
+
+
 def api_generate(
     role: str,
     topic: str,
@@ -156,7 +196,10 @@ def api_generate(
     model: str,
     success_guidelines: str = "",
     named_entity_required: bool = False,
+    required_keywords: list[str] = None,
 ) -> list[str]:
+    if required_keywords is None:
+        required_keywords = []
     prompt = build_prompt(
         topic=topic,
         trend_hint=trend_hint,
@@ -164,6 +207,7 @@ def api_generate(
         role=role,
         success_guidelines=success_guidelines,
         named_entity_required=named_entity_required,
+        required_keywords=required_keywords,
     )
 
     # TPM250目安チェック（超過しそうなら短縮）
@@ -378,43 +422,53 @@ with tab1:
             success_guidelines = ""
 
         named_entity_required = is_named_entity_required(topic)
+        required_keywords = collect_required_keywords(topic, trend_hint)
 
-        def gen_role(role: str, n_each: int, s_guidelines: str = "", name_required: bool = False) -> list[str]:
+        def gen_role(
+            role: str,
+            n_each: int,
+            s_guidelines: str = "",
+            name_required: bool = False,
+            req_kw: list[str] = None,
+        ) -> list[str]:
             rl.wait_for_rpm()
             return api_generate(
                 role, topic, trend_hint, n_each, api_key, model,
                 success_guidelines=s_guidelines,
                 named_entity_required=name_required,
+                required_keywords=req_kw or [],
             )
 
         # ===== 生成（calls_plan に応じて回す）=====
         rounds = 1 if calls_plan == 3 else 2
         for _ in range(rounds):
-            # MAIN
             if usage_can_call(usage):
-                all_main.extend(gen_role("MAIN", per_role, success_guidelines, named_entity_required))
+                all_main.extend(gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
-
-            # SUB
             if usage_can_call(usage):
-                all_sub.extend(gen_role("SUB", per_role, success_guidelines, named_entity_required))
+                all_sub.extend(gen_role("SUB", per_role, success_guidelines, named_entity_required, required_keywords))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
-
-            # EXP
             if usage_can_call(usage):
-                all_exp.extend(gen_role("EXP", per_role, success_guidelines, named_entity_required))
+                all_exp.extend(gen_role("EXP", per_role, success_guidelines, named_entity_required, required_keywords))
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
         # 固有名詞必須: 条件未達なら1回だけ MAIN を再生成
         if named_entity_required and not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
             if usage_can_call(usage):
-                retry_main = gen_role("MAIN", per_role, success_guidelines, True)
+                retry_main = gen_role("MAIN", per_role, success_guidelines, True, required_keywords)
                 all_main.extend(retry_main)
                 usage_inc(usage, 1); save_json(U_PATH, usage)
-            # それでもダメなら汎用ツイにフォールバック（API追加呼び出し無し）
             if not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
-                fallback = fallback_tweet_with_name(topic)
-                all_main.insert(0, fallback)
+                all_main.insert(0, fallback_tweet_with_name(topic))
+
+        # 必須キーワード（テーマ/トレンド）: 条件未達なら1回だけ MAIN を再生成
+        if required_keywords and not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
+            if usage_can_call(usage):
+                retry_main = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
+                all_main.extend(retry_main)
+                usage_inc(usage, 1); save_json(U_PATH, usage)
+            if not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
+                all_main.insert(0, fallback_tweet_with_keywords(required_keywords))
 
         # 重複除去
         def uniq(xs: list[str]) -> list[str]:
@@ -838,6 +892,64 @@ with tab3:
                         st.warning("取り消しに失敗しました。")
                 except Exception as e:
                     st.error(f"取り消しエラー: {e}")
+
+        # 編集：1行選んでフォームで編集 → 保存
+        st.markdown("---")
+        st.subheader("棋譜の編集")
+        if "id" in df.columns:
+            recent_list = recent.to_dict("records")
+            to_edit = st.selectbox(
+                "編集する行（ID=行番号）",
+                options=["(選択しない)"] + [f"id={r.get('id')} | {str(r.get('text', ''))[:40]}..." for r in recent_list if r.get("id") is not None],
+                index=0,
+                key="edit_row_select",
+            )
+            if to_edit != "(選択しない)":
+                try:
+                    rid = int(to_edit.split("|")[0].replace("id=", "").strip())
+                    row_to_edit = next((r for r in recent_list if r.get("id") == rid), None)
+                    if row_to_edit is not None:
+                        with st.form("edit_tweet_form"):
+                            st.caption("編集後「保存」でDBに反映します。")
+                            edit_text = st.text_area("投稿文", value=(row_to_edit.get("text") or ""), height=100, key="edit_text")
+                            _r = (row_to_edit.get("role") or "MAIN").strip()
+                            _idx = ["MAIN", "SUB", "EXP"].index(_r) if _r in ["MAIN", "SUB", "EXP"] else 0
+                            edit_role = st.selectbox("role", ["MAIN", "SUB", "EXP"], index=_idx, key="edit_role")
+                            def _safe_int(v, default: int = 0) -> int:
+                                try:
+                                    return int(float(v)) if v is not None and str(v).strip() != "" else default
+                                except (TypeError, ValueError):
+                                    return default
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                edit_impr = st.number_input("インプレッション", min_value=0, value=_safe_int(row_to_edit.get("impressions")), step=1, key="edit_impr")
+                                edit_likes = st.number_input("いいね", min_value=0, value=_safe_int(row_to_edit.get("likes")), step=1, key="edit_likes")
+                            with c2:
+                                edit_rts = st.number_input("RT", min_value=0, value=_safe_int(row_to_edit.get("rts")), step=1, key="edit_rts")
+                                edit_replies = st.number_input("返信", min_value=0, value=_safe_int(row_to_edit.get("replies")), step=1, key="edit_replies")
+                            with c3:
+                                edit_fol_b = st.number_input("フォロワー（前）", min_value=0, value=_safe_int(row_to_edit.get("followers_before")), step=1, key="edit_fol_b")
+                                edit_fol_a = st.number_input("フォロワー（後）", min_value=0, value=_safe_int(row_to_edit.get("followers_after")), step=1, key="edit_fol_a")
+                            edit_tweet_id = st.text_input("tweet_id（任意）", value=(row_to_edit.get("tweet_id") or ""), key="edit_tweet_id")
+                            if st.form_submit_button("保存して反映"):
+                                patch = {
+                                    "text": edit_text,
+                                    "role": edit_role,
+                                    "impressions": edit_impr,
+                                    "likes": edit_likes,
+                                    "rts": edit_rts,
+                                    "replies": edit_replies,
+                                    "followers_before": edit_fol_b,
+                                    "followers_after": edit_fol_a,
+                                    "tweet_id": edit_tweet_id,
+                                }
+                                if update_by_id(rid, patch):
+                                    st.success("更新しました。")
+                                    st.rerun()
+                                else:
+                                    st.warning("更新に失敗しました。")
+                except Exception as e:
+                    st.error(f"編集エラー: {e}")
         st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")
     else:
         st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。")
