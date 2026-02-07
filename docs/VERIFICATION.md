@@ -115,3 +115,31 @@ streamlit run app.py
   - Streamlit Cloud の「Clear cache」や「Reboot app」を実行してから再デプロイ。
 - **storage.py の存在**  
   - デプロイに含まれるファイルに `storage.py` が含まれ、`update_by_id` と `TWEETS_EDITABLE_COLUMNS` が定義されているか確認。
+
+---
+
+## 「Gemini failed: JSON not found」フォールバック
+
+### 事象
+
+- Gemini API は文章を返すが、JSON 形式で返らないことがあり、`json.loads` 失敗で例外になり UI にエラー表示される。
+
+### 対応内容（設計）
+
+1. **llm_gemini.py**  
+   - `_parse_or_fallback(raw)`: JSON パースを try/except で実施。失敗時は例外にせず `{"__fallback": True, "raw": raw}` を返す。  
+   - `gemini_json` は `_extract_json` の代わりに `_parse_or_fallback` を呼ぶ。
+2. **app.py api_generate**  
+   - `data.get("__fallback")` のとき、`raw` を 1 ツイートとして `postprocess_tweet` し、`([s], 1)` を返す。通常時は `(out, 0)`。  
+   - 戻り値を `tuple[list[str], int]`（本文リストとフォールバック件数）に統一。
+3. **app.py 生成フロー**  
+   - `gen_role` は `(lst, fc)` を返す。各 role で `fc` を集計し、`build_candidates` 後にその role の「末尾 fc 件」の候補に `json_fallback=True` と `pseudo` のデフォルトを付与。  
+   - フォールバックが 1 件以上あれば「生成完了（形式フォールバック）」と表示。
+4. **runner.py**  
+   - `data.get("__fallback")` のときは `tweet = data.get("raw", "")` で救出。
+
+### ゴール
+
+- 文章が生成されていれば、ツイートは必ず 1 本以上 UI に出る。
+- 「JSON not found」でアプリが止まらない。
+- エラーではなく「生成成功（形式フォールバック）」として扱う。

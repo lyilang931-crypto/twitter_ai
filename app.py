@@ -207,7 +207,7 @@ def api_generate(
     named_entity_required: bool = False,
     required_keywords: list[str] = None,
     diversity_hint: str = "",
-) -> list[str]:
+) -> tuple[list[str], int]:
     if required_keywords is None:
         required_keywords = []
     prompt = build_prompt(
@@ -237,14 +237,20 @@ def api_generate(
             retries=2,
             sleep_sec=2.2,
         )
+        # JSON で返らなかった場合のフォールバック: 生テキストを1ツイートとして救出
+        if data.get("__fallback"):
+            raw = data.get("raw", "") or ""
+            s = postprocess_tweet(raw)
+            if s and isinstance(s, str) and s.strip():
+                return ([s], 1)
+            return ([], 0)
         arr = data.get(role, [])
         out = []
         for x in arr:
             s = postprocess_tweet(str(x))
-            # None や空文字列を除外
             if s and isinstance(s, str) and s.strip():
                 out.append(s)
-        return out
+        return (out, 0)
     except RuntimeError as e:
         # API key expired, rate limit exceeded などのエラー時
         err_msg = str(e)
@@ -254,12 +260,10 @@ def api_generate(
             st.warning(f"⚠️ Gemini API のレート制限に達しました: {err_msg}")
         else:
             st.warning(f"⚠️ Gemini API エラー: {err_msg}")
-        # 空リストを返して処理を続行（UIは落とさない）
-        return []
+        return ([], 0)
     except Exception as e:
-        # その他の予期しないエラー
         st.warning(f"⚠️ 予期しないエラーが発生しました: {str(e)}")
-        return []
+        return ([], 0)
 
 # 明確に危険で除外すべき理由（2段階safetyの第1段階）
 DANGEROUS_REASONS = ["暴力/過激", "差別/属性一般化", "個人攻撃"]
@@ -325,6 +329,7 @@ def build_candidates(rows, w, role, texts):
             "components": comps,
             "flagged": flagged,
             "flagged_reason": flagged_reason,
+            "json_fallback": False,
         })
     
     return cands, {
@@ -456,7 +461,7 @@ with tab1:
             s_guidelines: str = "",
             name_required: bool = False,
             req_kw: list[str] = None,
-        ) -> list[str]:
+        ) -> tuple[list[str], int]:
             rl.wait_for_rpm()
             return api_generate(
                 role, topic, trend_hint, n_each, api_key, model,
@@ -468,22 +473,32 @@ with tab1:
 
         # ===== 生成（calls_plan に応じて回す）=====
         rounds = 1 if calls_plan == 3 else 2
+        main_fallback_count = 0
+        sub_fallback_count = 0
+        exp_fallback_count = 0
         for _ in range(rounds):
             if usage_can_call(usage):
-                all_main.extend(gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords))
+                lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
+                all_main.extend(lst)
+                main_fallback_count = fc
                 usage_inc(usage, 1); save_json(U_PATH, usage)
             if usage_can_call(usage):
-                all_sub.extend(gen_role("SUB", per_role, success_guidelines, named_entity_required, required_keywords))
+                lst, fc = gen_role("SUB", per_role, success_guidelines, named_entity_required, required_keywords)
+                all_sub.extend(lst)
+                sub_fallback_count = fc
                 usage_inc(usage, 1); save_json(U_PATH, usage)
             if usage_can_call(usage):
-                all_exp.extend(gen_role("EXP", per_role, success_guidelines, named_entity_required, required_keywords))
+                lst, fc = gen_role("EXP", per_role, success_guidelines, named_entity_required, required_keywords)
+                all_exp.extend(lst)
+                exp_fallback_count = fc
                 usage_inc(usage, 1); save_json(U_PATH, usage)
 
         # 固有名詞必須: 条件未達なら1回だけ MAIN を再生成
         if named_entity_required and not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
             if usage_can_call(usage):
-                retry_main = gen_role("MAIN", per_role, success_guidelines, True, required_keywords)
-                all_main.extend(retry_main)
+                lst, fc = gen_role("MAIN", per_role, success_guidelines, True, required_keywords)
+                all_main.extend(lst)
+                main_fallback_count = fc
                 usage_inc(usage, 1); save_json(U_PATH, usage)
             if not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
                 all_main.insert(0, fallback_tweet_with_name(topic))
@@ -491,8 +506,9 @@ with tab1:
         # 必須キーワード（テーマ/トレンド）: 条件未達なら1回だけ MAIN を再生成
         if required_keywords and not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
             if usage_can_call(usage):
-                retry_main = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
-                all_main.extend(retry_main)
+                lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
+                all_main.extend(lst)
+                main_fallback_count = fc
                 usage_inc(usage, 1); save_json(U_PATH, usage)
             if not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
                 all_main.insert(0, fallback_tweet_with_keywords(required_keywords))
@@ -513,6 +529,22 @@ with tab1:
         main_c, main_stats = build_candidates(rows, w, "MAIN", all_main)
         sub_c, sub_stats = build_candidates(rows, w, "SUB", all_sub)
         exp_c, exp_stats = build_candidates(rows, w, "EXP", all_exp)
+        # JSON フォールバックで救出した候補にフラグと安全なデフォルトを付与
+        for i in range(main_fallback_count):
+            if main_c and i < len(main_c):
+                c = main_c[-(i + 1)]
+                c["json_fallback"] = True
+                c.setdefault("pseudo", 0.5)
+        for i in range(sub_fallback_count):
+            if sub_c and i < len(sub_c):
+                c = sub_c[-(i + 1)]
+                c["json_fallback"] = True
+                c.setdefault("pseudo", 0.5)
+        for i in range(exp_fallback_count):
+            if exp_c and i < len(exp_c):
+                c = exp_c[-(i + 1)]
+                c["json_fallback"] = True
+                c.setdefault("pseudo", 0.5)
 
         # デバッグカウンターを表示
         generated_count = len(all_main) + len(all_sub) + len(all_exp)
@@ -550,11 +582,15 @@ with tab1:
             pass
 
         st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        st.session_state["json_fallback_used"] = (main_fallback_count + sub_fallback_count + exp_fallback_count) > 0
         try:
             log_event("generate", payload={"topic": topic, "count": total_final}, meta={"roles": ["MAIN", "SUB", "EXP"]})
         except Exception:
             pass
-        st.success("生成完了。上位候補を表示します。")
+        if main_fallback_count or sub_fallback_count or exp_fallback_count:
+            st.success("生成完了（形式フォールバック）。上位候補を表示します。")
+        else:
+            st.success("生成完了。上位候補を表示します。")
         
 
     pack = st.session_state.get("pack")

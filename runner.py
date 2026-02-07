@@ -64,14 +64,16 @@ def generate_candidates(role: str, topic: str, trend_hint: str, n: int, api_key:
             temperature=0.7,
         )
 
-        # dataの形はプロジェクトにより違うので、ここで「tweet本文」を取り出す
-        # よくある形式例: {"tweet": "..."} / {"text": "..."} / {"output": "..."}
-        tweet = (
-            data.get("tweet")
-            or data.get("text")
-            or data.get("output")
-            or ""
-        ).strip()
+        # JSON で返らなかった場合は生テキストを救出（__fallback）
+        if data.get("__fallback"):
+            tweet = (data.get("raw") or "").strip()
+        else:
+            tweet = (
+                data.get("tweet")
+                or data.get("text")
+                or data.get("output")
+                or ""
+            ).strip()
 
         if tweet:
             candidates.append({

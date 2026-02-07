@@ -5,11 +5,24 @@ from typing import Any, Dict
 import google.generativeai as genai
 
 def _extract_json(raw: str) -> Dict[str, Any]:
+    """先頭の { から末尾の } までを切り出して JSON パース。失敗時は ValueError / JSONDecodeError。"""
     s = raw.find("{")
     e = raw.rfind("}")
     if s == -1 or e == -1 or e <= s:
         raise ValueError(f"JSON not found:\n{raw}")
-    return json.loads(raw[s:e+1])
+    return json.loads(raw[s : e + 1])
+
+
+def _parse_or_fallback(raw: str) -> Dict[str, Any]:
+    """
+    raw を JSON としてパースする。失敗した場合は例外を出さず
+    __fallback 付きの dict を返し、呼び出し側で生テキストを1ツイートとして救出できるようにする。
+    """
+    try:
+        return _extract_json(raw)
+    except (ValueError, json.JSONDecodeError):
+        return {"__fallback": True, "raw": (raw or "").strip()}
+
 
 def gemini_json(
     prompt: str,
@@ -38,7 +51,7 @@ def gemini_json(
                 },
             )
             raw = (resp.text or "").strip()
-            return _extract_json(raw)
+            return _parse_or_fallback(raw)
         except Exception as e:
             last_err = e
             # API key expired や rate limit exceeded などのエラーを検出
