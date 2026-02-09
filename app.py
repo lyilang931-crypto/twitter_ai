@@ -10,10 +10,10 @@ import pandas as pd
 from rate_limit import RateLimiter, Limits, rough_token_count
 from llm_gemini import gemini_json
 from prompts import build_prompt
-from safety import safety_score_01, safety_check
+from safety import safety_score_01, safety_check, compute_safety_score
 from novelty import novelty_score
 from exp_score import tail_score, exp_utility
-from scoring import pseudo_reward_components, pseudo_score,速報_score,確定_score
+from scoring import pseudo_reward_components, pseudo_score, quality_score, 速報_score, 確定_score
 from weights import DEFAULT_W, sgd_update
 from selfplay import league_score
 from storage import (
@@ -34,6 +34,17 @@ from storage import (
     bandit_update,
     STATUS_PINNED,
     log_event,
+    DRAFT_STATUS_DRAFT,
+    DRAFT_STATUS_APPROVED,
+    DRAFT_STATUS_POSTED,
+    DRAFT_STATUS_REJECTED,
+    DRAFT_STATUS_SCHEDULED,
+    insert_draft,
+    read_drafts,
+    update_draft,
+    update_draft_status,
+    delete_draft,
+    get_scheduled_drafts,
 )
 try:
     from storage import update_by_id
@@ -48,6 +59,7 @@ from vocabulary_diversity import (
     vocab_diversity_penalty,
     format_synonym_hint,
 )
+from x_client import is_x_api_available, post_tweet
 
 # =========================
 # 基本設定
@@ -237,13 +249,23 @@ def api_generate(
             retries=2,
             sleep_sec=2.2,
         )
-        # JSON で返らなかった場合のフォールバック: 生テキストを1ツイートとして救出
+        # 多段フォールバック対応
         if data.get("__fallback"):
+            # 完全フォールバック: 生テキストを1ツイートとして救出
             raw = data.get("raw", "") or ""
             s = postprocess_tweet(raw)
             if s and isinstance(s, str) and s.strip():
                 return ([s], 1)
             return ([], 0)
+        if data.get("__text_fallback") or data.get("__array_fallback"):
+            # テキスト行分割/配列フォールバック
+            items = data.get("items", [])
+            out = []
+            for x in items:
+                s = postprocess_tweet(str(x))
+                if s and isinstance(s, str) and s.strip():
+                    out.append(s)
+            return (out, len(out))  # fallback count = rescued items
         arr = data.get(role, [])
         out = []
         for x in arr:
@@ -418,7 +440,7 @@ with st.sidebar:
 # =========================
 # Tabs
 # =========================
-tab1, tab2, tab3 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 実測入力(手入力最小/CSV可)", "③ 分析・学習(重み/レート)"])
+tab1, tab2, tab3, tab4 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 実測入力(手入力最小/CSV可)", "③ 分析・学習(重み/レート)", "④ 自動化（安全ガード付き）"])
 
 # =========================================================
 # ① 生成→自己対局→承認
@@ -582,6 +604,8 @@ with tab1:
             pass
 
         st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+        st.session_state["_auto_topic"] = topic
+        st.session_state["_auto_trend"] = trend_hint
         st.session_state["json_fallback_used"] = (main_fallback_count + sub_fallback_count + exp_fallback_count) > 0
         try:
             log_event("generate", payload={"topic": topic, "count": total_final}, meta={"roles": ["MAIN", "SUB", "EXP"]})
@@ -738,8 +762,30 @@ with tab2:
     st.subheader("実測入力：速報→確定（手入力最小）")
     approved = st.session_state.get("approved", {})
 
+    # 投稿済みドラフトから選択（自動入力）
+    try:
+        posted_drafts = read_drafts(status=DRAFT_STATUS_POSTED, limit=20)
+    except Exception:
+        posted_drafts = []
+    if posted_drafts:
+        st.caption("投稿済みの下書きから選択して実測データを入力できます。")
+        draft_options = ["(手動入力)"] + [
+            f"id={d.get('id')} | {d.get('role','?')} | {(d.get('text',''))[:40]}..."
+            for d in posted_drafts
+        ]
+        selected_draft = st.selectbox("投稿済み下書きから選択", draft_options, index=0, key="posted_draft_select")
+        if selected_draft != "(手動入力)":
+            try:
+                sel_id = int(selected_draft.split("|")[0].replace("id=", "").strip())
+                sel_draft = next((d for d in posted_drafts if d.get("id") == sel_id), None)
+                if sel_draft:
+                    st.session_state["_tab2_prefill"] = sel_draft
+            except Exception:
+                pass
+
+    prefill = st.session_state.get("_tab2_prefill", {})
     role_pick = st.selectbox("対象（役割）", ["MAIN","SUB","EXP"], index=0)
-    default_text = (approved.get(role_pick) or {}).get("text", "")
+    default_text = prefill.get("text") or (approved.get(role_pick) or {}).get("text", "")
 
     st.caption("最小入力：tweet_id(任意) + インプレ/いいね/RT/返信 + フォロワー前後（確定スコア用）")
     text = st.text_area("投稿文（コピペ）", value=default_text, height=120)
@@ -838,10 +884,25 @@ with tab2:
                 bandit_update(arm_id, float(s確定))
             except Exception:
                 pass
+            # 投稿済みドラフトに実測データを追記
+            if prefill and prefill.get("id"):
+                try:
+                    update_draft(prefill["id"], {
+                        "score_abs": float(s確定),
+                        "score_rel": float(s速報),
+                    })
+                    log_event("draft_metrics_updated", payload={
+                        "draft_id": prefill["id"],
+                        "確定": float(s確定),
+                        "速報": float(s速報),
+                    })
+                except Exception:
+                    pass
+                st.session_state.pop("_tab2_prefill", None)
         except Exception as e:
             st.error(f"保存に失敗しました: {e}")
         else:
-            st.success("保存＆学習しました。次の生成から“擬似評価の精度”が上がります。")
+            st.success('保存＆学習しました。次の生成から"擬似評価の精度"が上がります。')
             st.info(f"Abs: {abs_before:.1f} → {abs_rating:.1f} / Rel: {rel_before:.1f} → {rel_rating:.1f}")
 
     st.markdown("---")
@@ -933,8 +994,19 @@ with tab3:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         st.write("### 最近の棋譜（30件）")
+        # ステータスで色分け表示
+        if "status" in df.columns:
+            st.caption("ステータス: pinned=承認済み, confirmed=実測入力済み")
         recent = df.tail(30)
         st.dataframe(recent, use_container_width=True)
+
+        # 下書き件数を表示
+        try:
+            draft_count = len(read_drafts(status=DRAFT_STATUS_DRAFT, limit=100))
+            posted_count = len(read_drafts(status=DRAFT_STATUS_POSTED, limit=100))
+            st.caption(f"下書き: {draft_count}件 / 投稿済み: {posted_count}件")
+        except Exception:
+            pass
         # 論理削除：誤入力した行を取り消し
         if "id" in df.columns:
             st.caption("誤入力した行は下の「取り消し」で論理削除できます。")
@@ -1019,3 +1091,333 @@ with tab3:
         st.caption("見方：Pseudoが確定に寄ってきたら『疑似報酬が賢くなった』＝超高速学習が成立。")
     else:
         st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。")
+
+# =========================================================
+# ④ 自動化（安全ガード付き）
+# =========================================================
+with tab4:
+    st.subheader("自動化ダッシュボード（安全ガード付き）")
+
+    # --- 設定パネル ---
+    auto_col1, auto_col2, auto_col3 = st.columns(3)
+    with auto_col1:
+        auto_post_enabled = st.toggle("自動投稿を有効にする", value=False, key="auto_post_toggle")
+        x_available = is_x_api_available()
+        if auto_post_enabled and not x_available:
+            st.warning("X API認証情報が未設定です。手動投稿モードで動作します。")
+            auto_post_enabled = False
+    with auto_col2:
+        safety_threshold = st.slider("安全閾値", 0.0, 1.0, 0.7, 0.05, key="safety_thresh")
+    with auto_col3:
+        quality_threshold = st.slider("品質閾値", 0.0, 1.0, 0.5, 0.05, key="quality_thresh")
+
+    st.markdown("---")
+
+    # --- 生成候補を下書きに保存 ---
+    st.subheader("候補を下書きに保存")
+    pack = st.session_state.get("pack")
+    if pack:
+        save_topic = st.session_state.get("_auto_topic", topic if "topic" in dir() else "")
+        save_trend = st.session_state.get("_auto_trend", trend_hint if "trend_hint" in dir() else "")
+
+        if st.button("生成候補を全て下書きに保存", key="save_all_drafts"):
+            saved_count = 0
+            for role_name in ["MAIN", "SUB", "EXP"]:
+                cands = pack.get(role_name, [])
+                if not cands or not isinstance(cands, list):
+                    continue
+                for c in cands[:10]:  # 上位10件ずつ
+                    if not c or not isinstance(c, dict):
+                        continue
+                    text_val = (c.get("text") or "").strip()
+                    if not text_val:
+                        continue
+
+                    # 安全・品質スコア算出
+                    safety_info = compute_safety_score(text_val, save_topic)
+                    q_score = quality_score(text_val, save_topic, save_trend)
+
+                    flags = safety_info.get("flags", {})
+                    if not safety_info.get("auto_post_ok", False):
+                        flags["auto_blocked"] = True
+                        flags["block_reason"] = "安全スコア不足/リスクトピック"
+
+                    try:
+                        insert_draft({
+                            "topic": save_topic,
+                            "trend_hint": save_trend,
+                            "role": role_name,
+                            "text": text_val,
+                            "pseudo": float(c.get("pseudo", 0.0)),
+                            "league": float(c.get("league", 0.0)),
+                            "safety_score": safety_info.get("safety_score", 0.0),
+                            "quality_score": q_score,
+                            "novelty": float(c.get("novelty", 0.0)),
+                            "tail": float(c.get("tail", 0.0)),
+                            "flags": flags,
+                            "status": DRAFT_STATUS_DRAFT,
+                        })
+                        saved_count += 1
+                    except Exception as e:
+                        st.warning(f"下書き保存エラー: {e}")
+            if saved_count > 0:
+                try:
+                    log_event("drafts_saved", payload={"count": saved_count})
+                except Exception:
+                    pass
+                st.success(f"{saved_count}件の候補を下書きに保存しました。")
+            else:
+                st.info("保存対象の候補がありません。")
+    else:
+        st.info("まず①タブで生成してください。生成後に候補を下書きとして保存できます。")
+
+    st.markdown("---")
+
+    # --- 下書き一覧 ---
+    st.subheader("下書き一覧")
+    filter_status = st.selectbox(
+        "ステータスで絞り込み",
+        ["全て", "draft", "approved", "scheduled", "posted", "rejected"],
+        index=0,
+        key="draft_filter",
+    )
+
+    try:
+        if filter_status == "全て":
+            drafts = read_drafts(status=None, limit=100)
+        else:
+            drafts = read_drafts(status=filter_status, limit=100)
+    except Exception as e:
+        st.error(f"下書き読み込みエラー: {e}")
+        drafts = []
+
+    if drafts:
+        st.caption(f"表示件数: {len(drafts)}件")
+
+        for d in drafts:
+            draft_id = d.get("id", "?")
+            status = d.get("status", "draft")
+            role = d.get("role", "?")
+            text = (d.get("text") or "")[:60]
+            s_score = d.get("safety_score", 0.0)
+            q_score_val = d.get("quality_score", 0.0)
+            flags = d.get("flags", {})
+
+            # ステータスごとの色分け
+            status_emoji = {
+                "draft": "📝", "approved": "✅", "scheduled": "⏰",
+                "posted": "🚀", "rejected": "❌",
+            }.get(status, "❓")
+
+            # リスク表示
+            risk_warning = ""
+            if flags.get("auto_blocked"):
+                risk_warning = " ⚠️ 自動投稿ブロック"
+            if flags.get("topic_risk"):
+                risk_warning += f" [リスク: {', '.join(flags['topic_risk'])}]"
+
+            with st.expander(
+                f"{status_emoji} [{status}] {role} | 安全={s_score:.2f} 品質={q_score_val:.2f}{risk_warning} | {text}...",
+                expanded=False,
+            ):
+                st.write(d.get("text", ""))
+                detail_col1, detail_col2 = st.columns(2)
+                with detail_col1:
+                    st.write({
+                        "ID": draft_id,
+                        "role": role,
+                        "topic": d.get("topic", ""),
+                        "pseudo": round(float(d.get("pseudo", 0)), 3),
+                        "league": round(float(d.get("league", 0)), 3),
+                        "novelty": round(float(d.get("novelty", 0)), 3),
+                    })
+                with detail_col2:
+                    st.write({
+                        "safety_score": round(s_score, 3),
+                        "quality_score": round(q_score_val, 3),
+                        "status": status,
+                        "tweet_id": d.get("tweet_id", ""),
+                        "scheduled_at": d.get("scheduled_at", ""),
+                        "posted_at": d.get("posted_at", ""),
+                    })
+                if flags:
+                    st.json(flags)
+
+                # --- アクションボタン ---
+                btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+
+                with btn_col1:
+                    if status == "draft" and st.button("承認", key=f"approve_{draft_id}"):
+                        try:
+                            update_draft_status(draft_id, DRAFT_STATUS_APPROVED)
+                            log_event("draft_approved", payload={"draft_id": draft_id})
+                            st.success("承認しました。")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"承認エラー: {e}")
+
+                with btn_col2:
+                    if status in ("draft", "approved") and st.button("却下", key=f"reject_{draft_id}"):
+                        try:
+                            update_draft_status(draft_id, DRAFT_STATUS_REJECTED)
+                            log_event("draft_rejected", payload={"draft_id": draft_id})
+                            st.success("却下しました。")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"却下エラー: {e}")
+
+                with btn_col3:
+                    if status in ("draft", "approved"):
+                        sched_time = st.text_input(
+                            "予約日時 (YYYY-MM-DD HH:MM)",
+                            key=f"sched_{draft_id}",
+                            placeholder="2025-01-15 09:00",
+                        )
+                        if st.button("予約", key=f"schedule_{draft_id}"):
+                            if sched_time and len(sched_time) >= 10:
+                                try:
+                                    update_draft_status(
+                                        draft_id,
+                                        DRAFT_STATUS_SCHEDULED,
+                                        extra={"scheduled_at": sched_time},
+                                    )
+                                    log_event("draft_scheduled", payload={"draft_id": draft_id, "scheduled_at": sched_time})
+                                    st.success(f"予約しました: {sched_time}")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"予約エラー: {e}")
+                            else:
+                                st.warning("日時を入力してください。")
+
+                with btn_col4:
+                    if status in ("approved", "scheduled"):
+                        if st.button("投稿", key=f"post_{draft_id}"):
+                            post_text = d.get("text", "")
+                            # 安全チェック再実行
+                            safety_recheck = compute_safety_score(post_text, d.get("topic", ""))
+                            if not safety_recheck.get("auto_post_ok", False):
+                                st.error("安全チェックに失敗しました。手動確認が必要です。")
+                                st.json(safety_recheck.get("flags", {}))
+                            elif auto_post_enabled and x_available:
+                                # X API で投稿
+                                result = post_tweet(post_text)
+                                if result.get("success"):
+                                    tweet_id_posted = result.get("tweet_id", "")
+                                    from datetime import datetime
+                                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    update_draft_status(
+                                        draft_id,
+                                        DRAFT_STATUS_POSTED,
+                                        extra={"posted_at": now_str, "tweet_id": tweet_id_posted},
+                                    )
+                                    # 棋譜にも追記
+                                    try:
+                                        append_row(LOG_PATH, {
+                                            "status": STATUS_PINNED,
+                                            "date": str(date.today()),
+                                            "role": d.get("role", "MAIN"),
+                                            "tweet_id": tweet_id_posted,
+                                            "text": post_text,
+                                            "impressions": "0", "likes": "0", "rts": "0", "replies": "0",
+                                            "followers_before": "0", "followers_after": "0",
+                                            "Pseudo": str(d.get("pseudo", "")),
+                                            "速報": "", "確定": "",
+                                            "novelty": str(d.get("novelty", "")),
+                                            "safety": str(d.get("safety_score", "")),
+                                            "tail": str(d.get("tail", "")),
+                                            "abs_rating_before": "", "abs_rating_after": "",
+                                            "rel_rating_before": "", "rel_rating_after": "",
+                                        })
+                                    except Exception:
+                                        pass
+                                    log_event("draft_posted", payload={"draft_id": draft_id, "tweet_id": tweet_id_posted})
+                                    st.success(f"投稿しました! tweet_id={tweet_id_posted}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"投稿失敗: {result.get('error', '不明')}")
+                            else:
+                                # 手動投稿モード: テキストを表示してコピー
+                                st.info("手動投稿モード: 下のテキストをコピーしてXに投稿してください。")
+                                st.code(post_text, language=None)
+                                if st.button("投稿済みとしてマーク", key=f"mark_posted_{draft_id}"):
+                                    from datetime import datetime
+                                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    update_draft_status(
+                                        draft_id,
+                                        DRAFT_STATUS_POSTED,
+                                        extra={"posted_at": now_str},
+                                    )
+                                    log_event("draft_posted_manual", payload={"draft_id": draft_id})
+                                    st.success("投稿済みとしてマークしました。")
+                                    st.rerun()
+    else:
+        st.info("下書きがありません。①タブで生成後、「候補を全て下書きに保存」してください。")
+
+    st.markdown("---")
+
+    # --- スケジュール処理（擬似スケジューラ） ---
+    st.subheader("スケジュール処理")
+    if st.button("予約済み下書きを今すぐ処理", key="process_scheduled"):
+        try:
+            scheduled = get_scheduled_drafts()
+            if not scheduled:
+                st.info("処理対象の予約がありません。")
+            else:
+                processed = 0
+                for sd in scheduled:
+                    sd_id = sd.get("id")
+                    sd_text = sd.get("text", "")
+                    sd_safety = compute_safety_score(sd_text, sd.get("topic", ""))
+
+                    if not sd_safety.get("auto_post_ok", False):
+                        st.warning(f"ID={sd_id}: 安全チェック不合格 → スキップ（手動承認へ）")
+                        update_draft_status(sd_id, DRAFT_STATUS_DRAFT, extra={"flags": sd_safety.get("flags", {})})
+                        continue
+
+                    if auto_post_enabled and x_available:
+                        result = post_tweet(sd_text)
+                        if result.get("success"):
+                            from datetime import datetime
+                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            update_draft_status(
+                                sd_id,
+                                DRAFT_STATUS_POSTED,
+                                extra={"posted_at": now_str, "tweet_id": result.get("tweet_id", "")},
+                            )
+                            log_event("scheduled_posted", payload={"draft_id": sd_id, "tweet_id": result.get("tweet_id", "")})
+                            processed += 1
+                        else:
+                            st.warning(f"ID={sd_id}: 投稿失敗 - {result.get('error', '不明')}")
+                    else:
+                        st.info(f"ID={sd_id}: 手動投稿モード。テキストをコピーしてください:")
+                        st.code(sd_text, language=None)
+                        processed += 1
+
+                if processed > 0:
+                    st.success(f"{processed}件の予約を処理しました。")
+        except Exception as e:
+            st.error(f"スケジュール処理エラー: {e}")
+
+    # --- 条件付き自動投稿（Phase2） ---
+    st.markdown("---")
+    st.subheader("条件付き自動投稿")
+    st.caption("安全スコア・品質スコアが閾値を超えた下書きのみ自動投稿候補にします。")
+
+    if st.button("閾値超え候補を一括承認", key="auto_approve"):
+        try:
+            all_drafts = read_drafts(status=DRAFT_STATUS_DRAFT, limit=50)
+            auto_approved = 0
+            for d in all_drafts:
+                s = float(d.get("safety_score", 0))
+                q = float(d.get("quality_score", 0))
+                flags = d.get("flags", {})
+                if s >= safety_threshold and q >= quality_threshold and not flags.get("auto_blocked"):
+                    update_draft_status(d["id"], DRAFT_STATUS_APPROVED)
+                    auto_approved += 1
+            if auto_approved > 0:
+                log_event("auto_approved", payload={"count": auto_approved, "safety_thresh": safety_threshold, "quality_thresh": quality_threshold})
+                st.success(f"{auto_approved}件を自動承認しました。")
+            else:
+                st.info("閾値を超える候補がありませんでした。")
+        except Exception as e:
+            st.error(f"自動承認エラー: {e}")

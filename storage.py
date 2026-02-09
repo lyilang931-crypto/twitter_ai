@@ -67,6 +67,17 @@ __all__ = [
     "STATUS_CONFIRMED",
     "STATUS_CANDIDATE",
     "STATUS_DELETED",
+    "DRAFT_STATUS_DRAFT",
+    "DRAFT_STATUS_APPROVED",
+    "DRAFT_STATUS_POSTED",
+    "DRAFT_STATUS_REJECTED",
+    "DRAFT_STATUS_SCHEDULED",
+    "insert_draft",
+    "read_drafts",
+    "update_draft",
+    "update_draft_status",
+    "delete_draft",
+    "get_scheduled_drafts",
     "log_event",
     "read_events",
 ]
@@ -79,6 +90,13 @@ STATUS_CONFIRMED = "confirmed"
 STATUS_PINNED = "pinned"
 STATUS_CANDIDATE = "candidate"
 STATUS_DELETED = "deleted"
+
+# Draft statuses
+DRAFT_STATUS_DRAFT = "draft"
+DRAFT_STATUS_APPROVED = "approved"
+DRAFT_STATUS_POSTED = "posted"
+DRAFT_STATUS_REJECTED = "rejected"
+DRAFT_STATUS_SCHEDULED = "scheduled"
 
 LOG_PATH_LEGACY = "data/twitter_log.csv"
 W_PATH_LEGACY = "data/weights.json"
@@ -194,6 +212,30 @@ def _ensure_schema(conn) -> None:
                 meta_json TEXT NOT NULL
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS drafts (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                topic TEXT NOT NULL DEFAULT '',
+                trend_hint TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'MAIN',
+                text TEXT NOT NULL DEFAULT '',
+                score_abs REAL NOT NULL DEFAULT 0.0,
+                score_rel REAL NOT NULL DEFAULT 0.0,
+                pseudo REAL NOT NULL DEFAULT 0.0,
+                league REAL NOT NULL DEFAULT 0.0,
+                safety_score REAL NOT NULL DEFAULT 0.0,
+                quality_score REAL NOT NULL DEFAULT 0.0,
+                novelty REAL NOT NULL DEFAULT 0.0,
+                tail REAL NOT NULL DEFAULT 0.0,
+                flags TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'draft',
+                scheduled_at TIMESTAMPTZ,
+                posted_at TIMESTAMPTZ,
+                tweet_id TEXT,
+                deleted INTEGER NOT NULL DEFAULT 0
+            )
+        """)
     else:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS tweets (
@@ -266,6 +308,30 @@ def _ensure_schema(conn) -> None:
                 event_type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 meta_json TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                topic TEXT NOT NULL DEFAULT '',
+                trend_hint TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'MAIN',
+                text TEXT NOT NULL DEFAULT '',
+                score_abs REAL NOT NULL DEFAULT 0.0,
+                score_rel REAL NOT NULL DEFAULT 0.0,
+                pseudo REAL NOT NULL DEFAULT 0.0,
+                league REAL NOT NULL DEFAULT 0.0,
+                safety_score REAL NOT NULL DEFAULT 0.0,
+                quality_score REAL NOT NULL DEFAULT 0.0,
+                novelty REAL NOT NULL DEFAULT 0.0,
+                tail REAL NOT NULL DEFAULT 0.0,
+                flags TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'draft',
+                scheduled_at TEXT,
+                posted_at TEXT,
+                tweet_id TEXT,
+                deleted INTEGER NOT NULL DEFAULT 0
             )
         """)
     conn.commit()
@@ -628,5 +694,178 @@ def bandit_update(arm_id: str, reward: float) -> None:
         else:
             cur.execute(_sql("INSERT INTO bandit (arm_id, pulls, rewards) VALUES (?, 1, ?)"), (arm_id, reward))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- drafts CRUD ----------
+
+def insert_draft(draft: Dict[str, Any]) -> Optional[int]:
+    """下書きを1件挿入し、挿入されたIDを返す。"""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cols = [
+            "topic", "trend_hint", "role", "text",
+            "score_abs", "score_rel", "pseudo", "league",
+            "safety_score", "quality_score", "novelty", "tail",
+            "flags", "status", "scheduled_at", "tweet_id",
+        ]
+        vals = [
+            str(draft.get("topic", "")),
+            str(draft.get("trend_hint", "")),
+            str(draft.get("role", "MAIN")),
+            str(draft.get("text", "")),
+            float(draft.get("score_abs", 0.0)),
+            float(draft.get("score_rel", 0.0)),
+            float(draft.get("pseudo", 0.0)),
+            float(draft.get("league", 0.0)),
+            float(draft.get("safety_score", 0.0)),
+            float(draft.get("quality_score", 0.0)),
+            float(draft.get("novelty", 0.0)),
+            float(draft.get("tail", 0.0)),
+            json.dumps(draft.get("flags", {}), ensure_ascii=False) if isinstance(draft.get("flags"), dict) else str(draft.get("flags", "{}")),
+            str(draft.get("status", DRAFT_STATUS_DRAFT)),
+            draft.get("scheduled_at") or None,
+            draft.get("tweet_id") or None,
+        ]
+        placeholders = ",".join([_ph()] * len(vals))
+        sql = _sql("INSERT INTO drafts (" + ",".join(cols) + ") VALUES (" + placeholders + ")")
+        cur.execute(sql, vals)
+        conn.commit()
+        if _backend == "postgres":
+            cur.execute("SELECT lastval()")
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+        else:
+            return cur.lastrowid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def read_drafts(
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """下書き一覧を取得。status指定時は絞り込み。deleted=0のみ。"""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        if status is not None:
+            cur.execute(
+                _sql("SELECT * FROM drafts WHERE deleted = 0 AND status = ? ORDER BY id DESC LIMIT ?"),
+                (status, limit),
+            )
+        else:
+            cur.execute(
+                _sql("SELECT * FROM drafts WHERE deleted = 0 ORDER BY id DESC LIMIT ?"),
+                (limit,),
+            )
+        rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = _row_to_dict(cur, r)
+            # flags を dict にパース
+            try:
+                d["flags"] = json.loads(d.get("flags") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["flags"] = {}
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def update_draft(draft_id: int, patch: Dict[str, Any]) -> bool:
+    """下書きの任意フィールドを更新する。"""
+    if not patch or draft_id is None:
+        return False
+    allowed_cols = {
+        "topic", "trend_hint", "role", "text",
+        "score_abs", "score_rel", "pseudo", "league",
+        "safety_score", "quality_score", "novelty", "tail",
+        "flags", "status", "scheduled_at", "posted_at", "tweet_id",
+    }
+    filtered = {}
+    for k, v in patch.items():
+        if k in allowed_cols:
+            if k == "flags" and isinstance(v, dict):
+                filtered[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                filtered[k] = v
+    if not filtered:
+        return False
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        set_parts = [f"{k} = {_ph()}" for k in filtered]
+        vals = list(filtered.values()) + [draft_id]
+        cur.execute(
+            _sql("UPDATE drafts SET " + ", ".join(set_parts) + " WHERE id = ? AND deleted = 0"),
+            vals,
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_draft_status(draft_id: int, new_status: str, extra: Optional[Dict[str, Any]] = None) -> bool:
+    """下書きのステータスを変更する。extraでposted_at/tweet_id等も同時更新可。"""
+    patch = {"status": new_status}
+    if extra:
+        patch.update(extra)
+    return update_draft(draft_id, patch)
+
+
+def delete_draft(draft_id: int) -> bool:
+    """下書きを論理削除する。"""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            _sql("UPDATE drafts SET deleted = 1 WHERE id = ? AND deleted = 0"),
+            (draft_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_scheduled_drafts() -> List[Dict[str, Any]]:
+    """scheduled_at <= now() の未投稿ドラフトを取得する（スケジューラ用）。"""
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        if _backend == "postgres":
+            cur.execute(
+                "SELECT * FROM drafts WHERE deleted = 0 AND status = %s AND scheduled_at <= now() ORDER BY scheduled_at ASC LIMIT 10",
+                (DRAFT_STATUS_SCHEDULED,),
+            )
+        else:
+            cur.execute(
+                _sql("SELECT * FROM drafts WHERE deleted = 0 AND status = ? AND scheduled_at <= datetime('now','localtime') ORDER BY scheduled_at ASC LIMIT 10"),
+                (DRAFT_STATUS_SCHEDULED,),
+            )
+        rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = _row_to_dict(cur, r)
+            try:
+                d["flags"] = json.loads(d.get("flags") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["flags"] = {}
+            out.append(d)
+        return out
     finally:
         conn.close()
