@@ -1,6 +1,8 @@
 # pages_content.py — AdSense審査用の固定ページコンテンツ
 from __future__ import annotations
 
+import streamlit as st
+
 
 def render_about_page():
     """About（運営者情報）ページ"""
