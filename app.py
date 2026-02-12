@@ -60,12 +60,37 @@ from vocabulary_diversity import (
     format_synonym_hint,
 )
 from x_client import is_x_api_available, post_tweet
+from analytics import init_analytics, track_event
+from adsense_utils import init_adsense, is_ads_enabled
+from pages_content import (
+    render_about_page,
+    render_privacy_page,
+    render_terms_page,
+    render_contact_page,
+    render_blog_page,
+)
 
 # =========================
 # 基本設定
 # =========================
 st.set_page_config(page_title="TwitterAI", layout="wide")
-st.title("Twitter自動化/ 超高速学習")
+init_analytics()  # GA4/GTM タグ挿入（ID未設定なら何もしない）
+init_adsense()  # AdSense タグ挿入（ENABLE_ADS=false なら何もしない）
+
+# =========================
+# ページルーティング
+# =========================
+PAGE_HOME = "Home"
+PAGE_ABOUT = "About"
+PAGE_PRIVACY = "Privacy Policy"
+PAGE_TERMS = "Terms"
+PAGE_CONTACT = "Contact"
+PAGE_BLOG = "Blog/Updates"
+
+# クエリパラメータまたはセッション状態でページを決定
+current_page = st.query_params.get("page", PAGE_HOME)
+if current_page not in [PAGE_HOME, PAGE_ABOUT, PAGE_PRIVACY, PAGE_TERMS, PAGE_CONTACT, PAGE_BLOG]:
+    current_page = PAGE_HOME
 
 # =========================
 # Paths
@@ -278,13 +303,17 @@ def api_generate(
         err_msg = str(e)
         if "api key" in err_msg.lower() or "expired" in err_msg.lower():
             st.warning(f"⚠️ Gemini API キーが無効または期限切れです: {err_msg}")
+            track_event("generate_error", {"error_type": "api_key_invalid", "role": role})
         elif "rate limit" in err_msg.lower() or "quota" in err_msg.lower():
             st.warning(f"⚠️ Gemini API のレート制限に達しました: {err_msg}")
+            track_event("generate_error", {"error_type": "rate_limit", "role": role})
         else:
             st.warning(f"⚠️ Gemini API エラー: {err_msg}")
+            track_event("generate_error", {"error_type": "gemini_runtime", "role": role})
         return ([], 0)
     except Exception as e:
         st.warning(f"⚠️ 予期しないエラーが発生しました: {str(e)}")
+        track_event("generate_error", {"error_type": "unexpected", "role": role})
         return ([], 0)
 
 # 明確に危険で除外すべき理由（2段階safetyの第1段階）
@@ -401,365 +430,403 @@ rel_rating = last_rating("rel_rating_after", 1000.0)
 # Sidebar
 # =========================
 with st.sidebar:
-    st.subheader("運用設定（制限回避）")
-    api_key = load_api_key()
-    st.caption(f"RPD: {LIMITS.rpd} / RPM: {LIMITS.rpm} / TPM目安: {LIMITS.tpm}")
-    today_calls = int(usage.get(today_key(), {}).get("calls", 0))
-    st.metric("本日APIコール数", f"{today_calls} / {LIMITS.rpd}")
+    # ページ選択（AdSense審査用）
+    st.subheader("ページ")
+    page_selected = st.radio(
+        "ページを選択",
+        [PAGE_HOME, PAGE_ABOUT, PAGE_PRIVACY, PAGE_TERMS, PAGE_CONTACT, PAGE_BLOG],
+        index=[PAGE_HOME, PAGE_ABOUT, PAGE_PRIVACY, PAGE_TERMS, PAGE_CONTACT, PAGE_BLOG].index(current_page) if current_page in [PAGE_HOME, PAGE_ABOUT, PAGE_PRIVACY, PAGE_TERMS, PAGE_CONTACT, PAGE_BLOG] else 0,
+        label_visibility="visible",
+    )
+    if page_selected != current_page:
+        st.query_params["page"] = page_selected
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Home ページ以外では運用設定を非表示（軽量化）
+    if current_page == PAGE_HOME:
+        st.subheader("運用設定（制限回避）")
+        api_key = load_api_key()
+        st.caption(f"RPD: {LIMITS.rpd} / RPM: {LIMITS.rpm} / TPM目安: {LIMITS.tpm}")
+        today_calls = int(usage.get(today_key(), {}).get("calls", 0))
+        st.metric("本日APIコール数", f"{today_calls} / {LIMITS.rpd}")
 
-    model = 'gemini-2.5-flash-lite'
-    st.write(f"モデル: **{model}**（固定）")
+        model = 'gemini-2.5-flash-lite'
+        st.write(f"モデル: **{model}**（固定）")
 
-    if not api_key:
-        st.error("Secretsに Gemini_API_KEY が未設定です。")
-        st.stop()
-
-    st.subheader("トレンド入力（手入力・最小）")
-    trend_hint = st.text_input("今日のトレンド（任意）", value="日経・AI・スタートアップ・副業・金利")
-
-    st.subheader("候補数（自動最適）")
-    # 制限と速度を最優先。デフォは90案（3回×30）
-    target = st.selectbox("候補規模", ["最速(90案)", "強め(120案)", "重め(150案)"], index=0)
-    if target == "最速(90案)":
-        per_role = 30
-        calls_plan = 3
-    elif target == "強め(120案)":
-        per_role = 40
-        calls_plan = 3
-    else:
-        per_role = 25
-        calls_plan = 6  # 2回に分割して150相当（RPD的にギリ余裕）
-
-    st.caption("※『200案』は“内部リーグ200局”で代替（速い＆制限踏まない）。")
-
-    st.subheader("レーティング")
-    baseline = st.slider("Baseline（勝率基準）", 0.40, 0.70, 0.50, 0.01)
-    k_abs = st.slider("K（絶対）", 4.0, 32.0, 16.0, 1.0)
-    k_rel = st.slider("K（相対）", 4.0, 32.0, 16.0, 1.0)
-
-# =========================
-# Tabs
-# =========================
-tab1, tab2, tab3, tab4 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 実測入力(手入力最小/CSV可)", "③ 分析・学習(重み/レート)", "④ 自動化（安全ガード付き）"])
-
-# =========================================================
-# ① 生成→自己対局→承認
-# =========================================================
-with tab1:
-    st.subheader("今日のテーマ（あなたっぽさ：冷酷×設計×起業×経済）")
-    topic = st.text_input("テーマ", value="起業で失敗する人の共通点")
-
-    if st.button("生成（制限回避）→ 内部自己対局 → 上位を提示"):
-        if not usage_can_call(usage):
-            st.error("本日のRPD上限に到達。明日また回してください。")
+        if not api_key:
+            st.error("Secretsに Gemini_API_KEY が未設定です。")
             st.stop()
 
-        st.info("生成開始：途切れ防止・JSON強制・レート制限待機を自動で行います。")
+        st.subheader("トレンド入力（手入力・最小）")
+        trend_hint = st.text_input("今日のトレンド（任意）", value="日経・AI・スタートアップ・副業・金利")
 
-        all_main: list[str] = []
-        all_sub: list[str] = []
-        all_exp: list[str] = []
-
-        # 成功テンプレTopNをガイドラインとして注入（自己蒸留）
-        try:
-            templates = get_success_templates(5)
-            success_guidelines = " / ".join(
-                to_guideline_line(t.get("data", {})) for t in templates if t.get("data")
-            ) if templates else ""
-        except Exception:
-            success_guidelines = ""
-
-        named_entity_required = is_named_entity_required(topic)
-        required_keywords = collect_required_keywords(topic, trend_hint)
-        # 語彙多様性: 直近で過多の語があればプロンプトに言い換え推奨を注入
-        _recent = (rows or [])[-20:]
-        _freq = recent_word_frequency(_recent, n=15) if _recent else {}
-        _overused = get_overused_words(_freq, threshold=3)
-        diversity_hint = format_synonym_hint(_overused)
-
-        def gen_role(
-            role: str,
-            n_each: int,
-            s_guidelines: str = "",
-            name_required: bool = False,
-            req_kw: list[str] = None,
-        ) -> tuple[list[str], int]:
-            rl.wait_for_rpm()
-            return api_generate(
-                role, topic, trend_hint, n_each, api_key, model,
-                success_guidelines=s_guidelines,
-                named_entity_required=name_required,
-                required_keywords=req_kw or [],
-                diversity_hint=diversity_hint,
-            )
-
-        # ===== 生成（calls_plan に応じて回す）=====
-        rounds = 1 if calls_plan == 3 else 2
-        main_fallback_count = 0
-        sub_fallback_count = 0
-        exp_fallback_count = 0
-        for _ in range(rounds):
-            if usage_can_call(usage):
-                lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
-                all_main.extend(lst)
-                main_fallback_count = fc
-                usage_inc(usage, 1); save_json(U_PATH, usage)
-            if usage_can_call(usage):
-                lst, fc = gen_role("SUB", per_role, success_guidelines, named_entity_required, required_keywords)
-                all_sub.extend(lst)
-                sub_fallback_count = fc
-                usage_inc(usage, 1); save_json(U_PATH, usage)
-            if usage_can_call(usage):
-                lst, fc = gen_role("EXP", per_role, success_guidelines, named_entity_required, required_keywords)
-                all_exp.extend(lst)
-                exp_fallback_count = fc
-                usage_inc(usage, 1); save_json(U_PATH, usage)
-
-        # 固有名詞必須: 条件未達なら1回だけ MAIN を再生成
-        if named_entity_required and not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
-            if usage_can_call(usage):
-                lst, fc = gen_role("MAIN", per_role, success_guidelines, True, required_keywords)
-                all_main.extend(lst)
-                main_fallback_count = fc
-                usage_inc(usage, 1); save_json(U_PATH, usage)
-            if not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
-                all_main.insert(0, fallback_tweet_with_name(topic))
-
-        # 必須キーワード（テーマ/トレンド）: 条件未達なら1回だけ MAIN を再生成
-        if required_keywords and not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
-            if usage_can_call(usage):
-                lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
-                all_main.extend(lst)
-                main_fallback_count = fc
-                usage_inc(usage, 1); save_json(U_PATH, usage)
-            if not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
-                all_main.insert(0, fallback_tweet_with_keywords(required_keywords))
-
-        # 重複除去
-        def uniq(xs: list[str]) -> list[str]:
-            seen = set()
-            out = []
-            for x in xs:
-                if x not in seen:
-                    out.append(x)
-                    seen.add(x)
-            return out
-
-        all_main, all_sub, all_exp = uniq(all_main), uniq(all_sub), uniq(all_exp)
-
-        # 候補 → 擬似採点
-        main_c, main_stats = build_candidates(rows, w, "MAIN", all_main)
-        sub_c, sub_stats = build_candidates(rows, w, "SUB", all_sub)
-        exp_c, exp_stats = build_candidates(rows, w, "EXP", all_exp)
-        # JSON フォールバックで救出した候補にフラグと安全なデフォルトを付与
-        for i in range(main_fallback_count):
-            if main_c and i < len(main_c):
-                c = main_c[-(i + 1)]
-                c["json_fallback"] = True
-                c.setdefault("pseudo", 0.5)
-        for i in range(sub_fallback_count):
-            if sub_c and i < len(sub_c):
-                c = sub_c[-(i + 1)]
-                c["json_fallback"] = True
-                c.setdefault("pseudo", 0.5)
-        for i in range(exp_fallback_count):
-            if exp_c and i < len(exp_c):
-                c = exp_c[-(i + 1)]
-                c["json_fallback"] = True
-                c.setdefault("pseudo", 0.5)
-
-        # デバッグカウンターを表示
-        generated_count = len(all_main) + len(all_sub) + len(all_exp)
-        total_empty_dropped = main_stats["empty_text_dropped"] + sub_stats["empty_text_dropped"] + exp_stats["empty_text_dropped"]
-        total_safety_dropped = main_stats["safety_dropped_count"] + sub_stats["safety_dropped_count"] + exp_stats["safety_dropped_count"]
-        total_safety_flagged = main_stats["safety_flagged_count"] + sub_stats["safety_flagged_count"] + exp_stats["safety_flagged_count"]
-        total_final = main_stats["final_count"] + sub_stats["final_count"] + exp_stats["final_count"]
-        
-        st.caption(f"📊 生成統計: 生成={generated_count}, 空文字除外={total_empty_dropped}, 危険除外={total_safety_dropped}, 警告付き={total_safety_flagged}, 最終候補={total_final}")
-        
-        # fallback: 最終候補が0の場合、flagged候補も含めて表示
-        if total_final == 0:
-            st.warning("⚠️ 最終候補が0件です。警告付き候補も含めて再評価します。")
-            # flagged候補も含めて再構築（危険なもの以外は全て保持）
-            main_c_fallback, _ = build_candidates(rows, w, "MAIN", all_main)
-            sub_c_fallback, _ = build_candidates(rows, w, "SUB", all_sub)
-            exp_c_fallback, _ = build_candidates(rows, w, "EXP", all_exp)
-            if len(main_c_fallback) > 0 or len(sub_c_fallback) > 0 or len(exp_c_fallback) > 0:
-                main_c = main_c_fallback
-                sub_c = sub_c_fallback
-                exp_c = exp_c_fallback
-                st.info("警告付き候補を含めて表示します。")
-
-        # 内部自己対局（200局相当）
-        main_c = league_score(main_c, rounds=200)
-        sub_c  = league_score(sub_c, rounds=200)
-        exp_c  = league_score(exp_c, rounds=200)
-        # Bandit で提示順位を最適化（フォロワー増を reward に学習）
-        try:
-            arms = bandit_get_all()
-            main_c = rank_candidates_by_bandit(main_c, arms)
-            sub_c  = rank_candidates_by_bandit(sub_c, arms)
-            exp_c  = rank_candidates_by_bandit(exp_c, arms)
-        except Exception:
-            pass
-
-        st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
-        st.session_state["_auto_topic"] = topic
-        st.session_state["_auto_trend"] = trend_hint
-        st.session_state["json_fallback_used"] = (main_fallback_count + sub_fallback_count + exp_fallback_count) > 0
-        try:
-            log_event("generate", payload={"topic": topic, "count": total_final}, meta={"roles": ["MAIN", "SUB", "EXP"]})
-        except Exception:
-            pass
-        if main_fallback_count or sub_fallback_count or exp_fallback_count:
-            st.success("生成完了（形式フォールバック）。上位候補を表示します。")
+        st.subheader("候補数（自動最適）")
+        # 制限と速度を最優先。デフォは90案（3回×30）
+        target = st.selectbox("候補規模", ["最速(90案)", "強め(120案)", "重め(150案)"], index=0)
+        if target == "最速(90案)":
+            per_role = 30
+            calls_plan = 3
+        elif target == "強め(120案)":
+            per_role = 40
+            calls_plan = 3
         else:
-            st.success("生成完了。上位候補を表示します。")
+            per_role = 25
+            calls_plan = 6  # 2回に分割して150相当（RPD的にギリ余裕）
+
+        st.caption("※『200案』は“内部リーグ200局”で代替（速い＆制限踏まない）。")
+
+        st.subheader("レーティング")
+        baseline = st.slider("Baseline（勝率基準）", 0.40, 0.70, 0.50, 0.01)
+        k_abs = st.slider("K（絶対）", 4.0, 32.0, 16.0, 1.0)
+        k_rel = st.slider("K（相対）", 4.0, 32.0, 16.0, 1.0)
+    else:
+        # Home 以外のページでは変数をデフォルト値で初期化（エラー回避）
+        api_key = ""
+        trend_hint = ""
+        per_role = 30
+        calls_plan = 3
+        baseline = 0.50
+        k_abs = 16.0
+        k_rel = 16.0
+
+# =========================
+# メインコンテンツ（ページ別）
+# =========================
+if current_page == PAGE_HOME:
+    st.title("Twitter自動化/ 超高速学習")
+    
+    # =========================
+    # Tabs
+    # =========================
+    tab1, tab2, tab3, tab4 = st.tabs(["① 生成→自己対局→承認(3ツイ)", "② 実測入力(手入力最小/CSV可)", "③ 分析・学習(重み/レート)", "④ 自動化（安全ガード付き）"])
+
+    # =========================================================
+    # ① 生成→自己対局→承認
+    # =========================================================
+    with tab1:
+        st.subheader("今日のテーマ（あなたっぽさ：冷酷×設計×起業×経済）")
+        topic = st.text_input("テーマ", value="起業で失敗する人の共通点")
+
+        if st.button("生成（制限回避）→ 内部自己対局 → 上位を提示"):
+            track_event("generate_click", {"topic_length": len(topic), "has_trend": bool(trend_hint.strip())})
+            if not usage_can_call(usage):
+                st.error("本日のRPD上限に到達。明日また回してください。")
+                track_event("generate_error", {"error_type": "rpd_limit"})
+                st.stop()
+
+            st.info("生成開始：途切れ防止・JSON強制・レート制限待機を自動で行います。")
+
+            all_main: list[str] = []
+            all_sub: list[str] = []
+            all_exp: list[str] = []
+
+            # 成功テンプレTopNをガイドラインとして注入（自己蒸留）
+            try:
+                templates = get_success_templates(5)
+                success_guidelines = " / ".join(
+                    to_guideline_line(t.get("data", {})) for t in templates if t.get("data")
+                ) if templates else ""
+            except Exception:
+                success_guidelines = ""
+
+            named_entity_required = is_named_entity_required(topic)
+            required_keywords = collect_required_keywords(topic, trend_hint)
+            # 語彙多様性: 直近で過多の語があればプロンプトに言い換え推奨を注入
+            _recent = (rows or [])[-20:]
+            _freq = recent_word_frequency(_recent, n=15) if _recent else {}
+            _overused = get_overused_words(_freq, threshold=3)
+            diversity_hint = format_synonym_hint(_overused)
+
+            def gen_role(
+                role: str,
+                n_each: int,
+                s_guidelines: str = "",
+                name_required: bool = False,
+                req_kw: list[str] = None,
+            ) -> tuple[list[str], int]:
+                rl.wait_for_rpm()
+                return api_generate(
+                    role, topic, trend_hint, n_each, api_key, model,
+                    success_guidelines=s_guidelines,
+                    named_entity_required=name_required,
+                    required_keywords=req_kw or [],
+                    diversity_hint=diversity_hint,
+                )
+
+            # ===== 生成（calls_plan に応じて回す）=====
+            rounds = 1 if calls_plan == 3 else 2
+            main_fallback_count = 0
+            sub_fallback_count = 0
+            exp_fallback_count = 0
+            for _ in range(rounds):
+                if usage_can_call(usage):
+                    lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
+                    all_main.extend(lst)
+                    main_fallback_count = fc
+                    usage_inc(usage, 1); save_json(U_PATH, usage)
+                if usage_can_call(usage):
+                    lst, fc = gen_role("SUB", per_role, success_guidelines, named_entity_required, required_keywords)
+                    all_sub.extend(lst)
+                    sub_fallback_count = fc
+                    usage_inc(usage, 1); save_json(U_PATH, usage)
+                if usage_can_call(usage):
+                    lst, fc = gen_role("EXP", per_role, success_guidelines, named_entity_required, required_keywords)
+                    all_exp.extend(lst)
+                    exp_fallback_count = fc
+                    usage_inc(usage, 1); save_json(U_PATH, usage)
+
+            # 固有名詞必須: 条件未達なら1回だけ MAIN を再生成
+            if named_entity_required and not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
+                if usage_can_call(usage):
+                    lst, fc = gen_role("MAIN", per_role, success_guidelines, True, required_keywords)
+                    all_main.extend(lst)
+                    main_fallback_count = fc
+                    usage_inc(usage, 1); save_json(U_PATH, usage)
+                if not any_tweet_contains_name(all_main + all_sub + all_exp, topic):
+                    all_main.insert(0, fallback_tweet_with_name(topic))
+
+            # 必須キーワード（テーマ/トレンド）: 条件未達なら1回だけ MAIN を再生成
+            if required_keywords and not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
+                if usage_can_call(usage):
+                    lst, fc = gen_role("MAIN", per_role, success_guidelines, named_entity_required, required_keywords)
+                    all_main.extend(lst)
+                    main_fallback_count = fc
+                    usage_inc(usage, 1); save_json(U_PATH, usage)
+                if not any_tweet_contains_keywords(all_main + all_sub + all_exp, required_keywords):
+                    all_main.insert(0, fallback_tweet_with_keywords(required_keywords))
+
+            # 重複除去
+            def uniq(xs: list[str]) -> list[str]:
+                seen = set()
+                out = []
+                for x in xs:
+                    if x not in seen:
+                        out.append(x)
+                        seen.add(x)
+                return out
+
+            all_main, all_sub, all_exp = uniq(all_main), uniq(all_sub), uniq(all_exp)
+
+            # 候補 → 擬似採点
+            main_c, main_stats = build_candidates(rows, w, "MAIN", all_main)
+            sub_c, sub_stats = build_candidates(rows, w, "SUB", all_sub)
+            exp_c, exp_stats = build_candidates(rows, w, "EXP", all_exp)
+            # JSON フォールバックで救出した候補にフラグと安全なデフォルトを付与
+            for i in range(main_fallback_count):
+                if main_c and i < len(main_c):
+                    c = main_c[-(i + 1)]
+                    c["json_fallback"] = True
+                    c.setdefault("pseudo", 0.5)
+            for i in range(sub_fallback_count):
+                if sub_c and i < len(sub_c):
+                    c = sub_c[-(i + 1)]
+                    c["json_fallback"] = True
+                    c.setdefault("pseudo", 0.5)
+            for i in range(exp_fallback_count):
+                if exp_c and i < len(exp_c):
+                    c = exp_c[-(i + 1)]
+                    c["json_fallback"] = True
+                    c.setdefault("pseudo", 0.5)
+
+            # デバッグカウンターを表示
+            generated_count = len(all_main) + len(all_sub) + len(all_exp)
+            total_empty_dropped = main_stats["empty_text_dropped"] + sub_stats["empty_text_dropped"] + exp_stats["empty_text_dropped"]
+            total_safety_dropped = main_stats["safety_dropped_count"] + sub_stats["safety_dropped_count"] + exp_stats["safety_dropped_count"]
+            total_safety_flagged = main_stats["safety_flagged_count"] + sub_stats["safety_flagged_count"] + exp_stats["safety_flagged_count"]
+            total_final = main_stats["final_count"] + sub_stats["final_count"] + exp_stats["final_count"]
+            
+            st.caption(f"📊 生成統計: 生成={generated_count}, 空文字除外={total_empty_dropped}, 危険除外={total_safety_dropped}, 警告付き={total_safety_flagged}, 最終候補={total_final}")
+            
+            # fallback: 最終候補が0の場合、flagged候補も含めて表示
+            if total_final == 0:
+                st.warning("⚠️ 最終候補が0件です。警告付き候補も含めて再評価します。")
+                # flagged候補も含めて再構築（危険なもの以外は全て保持）
+                main_c_fallback, _ = build_candidates(rows, w, "MAIN", all_main)
+                sub_c_fallback, _ = build_candidates(rows, w, "SUB", all_sub)
+                exp_c_fallback, _ = build_candidates(rows, w, "EXP", all_exp)
+                if len(main_c_fallback) > 0 or len(sub_c_fallback) > 0 or len(exp_c_fallback) > 0:
+                    main_c = main_c_fallback
+                    sub_c = sub_c_fallback
+                    exp_c = exp_c_fallback
+                    st.info("警告付き候補を含めて表示します。")
+
+            # 内部自己対局（200局相当）
+            main_c = league_score(main_c, rounds=200)
+            sub_c  = league_score(sub_c, rounds=200)
+            exp_c  = league_score(exp_c, rounds=200)
+            # Bandit で提示順位を最適化（フォロワー増を reward に学習）
+            try:
+                arms = bandit_get_all()
+                main_c = rank_candidates_by_bandit(main_c, arms)
+                sub_c  = rank_candidates_by_bandit(sub_c, arms)
+                exp_c  = rank_candidates_by_bandit(exp_c, arms)
+            except Exception:
+                pass
+
+            st.session_state["pack"] = {"MAIN": main_c, "SUB": sub_c, "EXP": exp_c}
+            st.session_state["_auto_topic"] = topic
+            st.session_state["_auto_trend"] = trend_hint
+            st.session_state["json_fallback_used"] = (main_fallback_count + sub_fallback_count + exp_fallback_count) > 0
+            try:
+                log_event("generate", payload={"topic": topic, "count": total_final}, meta={"roles": ["MAIN", "SUB", "EXP"]})
+            except Exception:
+                pass
+            if main_fallback_count or sub_fallback_count or exp_fallback_count:
+                st.success("生成完了（形式フォールバック）。上位候補を表示します。")
+                track_event("generate_success", {"candidates": total_final, "fallback_used": True, "fallback_count": main_fallback_count + sub_fallback_count + exp_fallback_count})
+            else:
+                st.success("生成完了。上位候補を表示します。")
+                track_event("generate_success", {"candidates": total_final, "fallback_used": False})
+            if total_final == 0:
+                track_event("generate_error", {"error_type": "zero_candidates"})
         
 
-    pack = st.session_state.get("pack")
-    if pack:
-        st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。警告付き候補（政治/経済など）も表示されます。")
+        pack = st.session_state.get("pack")
+        if pack:
+            st.caption("上位は『擬似報酬×EXP分散スコア×自己対局』で選抜。警告付き候補（政治/経済など）も表示されます。")
 
-        def show_role(role, title):
-            st.markdown(f"## {title}")
-            raw_cands = pack.get(role, [])
-            # None や非リストを安全に処理
-            if not raw_cands or not isinstance(raw_cands, list):
-                st.info(f"{title}: 候補がありません")
-                return
-            
-            # None や非 dict の要素を除外
-            cands = [c for c in raw_cands[:10] if c and isinstance(c, dict)]
-            
-            if not cands:
-                st.info(f"{title}: 有効な候補がありません")
-                return
-            
-            for i, c in enumerate(cands, start=1):
-                # text を安全に取得
-                t = c.get("text") if isinstance(c, dict) else None
-                if not t or not isinstance(t, str):
-                    t = "(no text)"
-                preview = t.replace("\n", " ")[:30]
+            def show_role(role, title):
+                st.markdown(f"## {title}")
+                raw_cands = pack.get(role, [])
+                # None や非リストを安全に処理
+                if not raw_cands or not isinstance(raw_cands, list):
+                    st.info(f"{title}: 候補がありません")
+                    return
+                
+                # None や非 dict の要素を除外
+                cands = [c for c in raw_cands[:10] if c and isinstance(c, dict)]
+                
+                if not cands:
+                    st.info(f"{title}: 有効な候補がありません")
+                    return
+                
+                for i, c in enumerate(cands, start=1):
+                    # text を安全に取得
+                    t = c.get("text") if isinstance(c, dict) else None
+                    if not t or not isinstance(t, str):
+                        t = "(no text)"
+                    preview = t.replace("\n", " ")[:30]
 
-                # flagged フラグを取得
-                flagged = c.get("flagged", False)
-                flagged_reason = c.get("flagged_reason", "")
+                    # flagged フラグを取得
+                    flagged = c.get("flagged", False)
+                    flagged_reason = c.get("flagged_reason", "")
 
-                # 数値を安全に取得（デフォルト値付き）
-                league_val = c.get("league", 0.0)
-                pseudo_val = c.get("pseudo", 0.0)
-                if not isinstance(league_val, (int, float)):
-                    league_val = 0.0
-                if not isinstance(pseudo_val, (int, float)):
-                    pseudo_val = 0.0
+                    # 数値を安全に取得（デフォルト値付き）
+                    league_val = c.get("league", 0.0)
+                    pseudo_val = c.get("pseudo", 0.0)
+                    if not isinstance(league_val, (int, float)):
+                        league_val = 0.0
+                    if not isinstance(pseudo_val, (int, float)):
+                        pseudo_val = 0.0
 
-                # expanderタイトルに警告マークを追加
-                title_prefix = "⚠️ " if flagged else ""
-                with st.expander(f"{title_prefix}#{i} league={league_val:.3f} pseudo={pseudo_val:.3f} {preview}..."):
-                    st.write(t)
-                    # 安全に dict の値を取得
-                    safety_val = c.get("safety", 0.0)
-                    novelty_val = c.get("novelty", 0.0)
-                    tail_val = c.get("tail", 0.0)
-                    st.write({
-                        "safety": safety_val if isinstance(safety_val, (int, float)) else 0.0,
-                        "novelty": round(novelty_val, 3) if isinstance(novelty_val, (int, float)) else 0.0,
-                        "tail": round(tail_val, 3) if isinstance(tail_val, (int, float)) else 0.0,
-                        "pseudo": round(pseudo_val, 3),
-                        "league": round(league_val, 3),
-                    })
-                    # flagged候補を警告表示（黄色）
-                    if flagged:
-                        st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
-                    st.code(t, language=None)
+                    # expanderタイトルに警告マークを追加
+                    title_prefix = "⚠️ " if flagged else ""
+                    with st.expander(f"{title_prefix}#{i} league={league_val:.3f} pseudo={pseudo_val:.3f} {preview}..."):
+                        st.write(t)
+                        # 安全に dict の値を取得
+                        safety_val = c.get("safety", 0.0)
+                        novelty_val = c.get("novelty", 0.0)
+                        tail_val = c.get("tail", 0.0)
+                        st.write({
+                            "safety": safety_val if isinstance(safety_val, (int, float)) else 0.0,
+                            "novelty": round(novelty_val, 3) if isinstance(novelty_val, (int, float)) else 0.0,
+                            "tail": round(tail_val, 3) if isinstance(tail_val, (int, float)) else 0.0,
+                            "pseudo": round(pseudo_val, 3),
+                            "league": round(league_val, 3),
+                        })
+                        # flagged候補を警告表示（黄色）
+                        if flagged:
+                            st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
+                        st.code(t, language=None)
 
-        show_role("MAIN", "朝(7-9) MAIN：本命（否定×断定）")
-        show_role("SUB", "昼(12-13) SUB：準本命（否定×数字/比較）")
-        show_role("EXP", "夜(20-22) EXP：実験（質問×逆説 / 分散最大化）")
+            show_role("MAIN", "朝(7-9) MAIN：本命（否定×断定）")
+            show_role("SUB", "昼(12-13) SUB：準本命（否定×数字/比較）")
+            show_role("EXP", "夜(20-22) EXP：実験（質問×逆説 / 分散最大化）")
 
-        st.markdown("## ✅ 承認（今日の3ツイ）")
-        col1, col2, col3 = st.columns(3)
+            st.markdown("## ✅ 承認（今日の3ツイ）")
+            col1, col2, col3 = st.columns(3)
 
-        def pick(role, idx_key):
-            pack = st.session_state.get("pack") or {}
-            raw_cands = pack.get(role, [])
-            # None や非リストを安全に処理
-            if not raw_cands or not isinstance(raw_cands, list):
-                return None
-            # None や非 dict の要素を除外
-            cands = [c for c in raw_cands if c and isinstance(c, dict)]
-            if not cands:
-                return None
-            idx = st.number_input(idx_key, min_value=1, max_value=min(10, len(cands)), value=1, step=1)
-            selected = cands[int(idx)-1]
-            return selected if selected and isinstance(selected, dict) else None
+            def pick(role, idx_key):
+                pack = st.session_state.get("pack") or {}
+                raw_cands = pack.get(role, [])
+                # None や非リストを安全に処理
+                if not raw_cands or not isinstance(raw_cands, list):
+                    return None
+                # None や非 dict の要素を除外
+                cands = [c for c in raw_cands if c and isinstance(c, dict)]
+                if not cands:
+                    return None
+                idx = st.number_input(idx_key, min_value=1, max_value=min(10, len(cands)), value=1, step=1)
+                selected = cands[int(idx)-1]
+                return selected if selected and isinstance(selected, dict) else None
 
-        with col1:
-            a_main = pick("MAIN", "MAINの採用順位(1-10)")
-        with col2:
-            a_sub = pick("SUB", "SUBの採用順位(1-10)")
-        with col3:
-            a_exp = pick("EXP", "EXPの採用順位(1-10)")
+            with col1:
+                a_main = pick("MAIN", "MAINの採用順位(1-10)")
+            with col2:
+                a_sub = pick("SUB", "SUBの採用順位(1-10)")
+            with col3:
+                a_exp = pick("EXP", "EXPの採用順位(1-10)")
 
-        if st.button("この3つを承認して保存（投稿用に固定）"):
-            approved = {"MAIN": a_main, "SUB": a_sub, "EXP": a_exp}
-            st.session_state["approved"] = approved
-            # 永続化：承認した3件をDBへ追記（確定で消えない）
-            today_str = str(date.today())
-            to_append = []
-            for role_name, cand in approved.items():
-                if cand and isinstance(cand, dict):
-                    text_val = (cand.get("text") or "").strip()
-                    to_append.append({
-                        "status": STATUS_PINNED,
-                        "date": today_str,
-                        "role": role_name,
-                        "tweet_id": "",
-                        "text": text_val,
-                        "impressions": "0",
-                        "likes": "0",
-                        "rts": "0",
-                        "replies": "0",
-                        "followers_before": "0",
-                        "followers_after": "0",
-                        "Pseudo": str(cand.get("pseudo", "")),
-                        "速報": "",
-                        "確定": "",
-                        "novelty": str(cand.get("novelty", "")),
-                        "safety": str(cand.get("safety", "")),
-                        "tail": str(cand.get("tail", "")),
-                        "abs_rating_before": f"{abs_rating:.2f}",
-                        "abs_rating_after": f"{abs_rating:.2f}",
-                        "rel_rating_before": f"{rel_rating:.2f}",
-                        "rel_rating_after": f"{rel_rating:.2f}",
-                    })
-            if to_append:
-                try:
-                    append_rows(to_append)
-                    log_event("pinned", payload={"roles": list(approved.keys()), "count": len(to_append)}, meta={"today": today_str})
-                except Exception as e:
-                    st.warning(f"DB追記でエラー（承認は画面に保持）: {e}")
-            st.success("承認保存しました（DBに記録済み）。②で実測入力へ。")
-            for k, v in approved.items():
-                if v and isinstance(v, dict):
-                    text_val = v.get("text", "")
-                    flagged = v.get("flagged", False)
-                    flagged_reason = v.get("flagged_reason", "")
-                    st.markdown(f"**{k}**")
-                    if flagged:
-                        st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
-                    st.code(text_val if text_val else "(no text)", language=None)
-                else:
-                    st.markdown(f"**{k}**")
-                    st.info("候補が選択されていません")
+            if st.button("この3つを承認して保存（投稿用に固定）"):
+                track_event("confirm_click", {"tab": "tab1", "roles": 3})
+                approved = {"MAIN": a_main, "SUB": a_sub, "EXP": a_exp}
+                st.session_state["approved"] = approved
+                # 永続化：承認した3件をDBへ追記（確定で消えない）
+                today_str = str(date.today())
+                to_append = []
+                for role_name, cand in approved.items():
+                    if cand and isinstance(cand, dict):
+                        text_val = (cand.get("text") or "").strip()
+                        to_append.append({
+                            "status": STATUS_PINNED,
+                            "date": today_str,
+                            "role": role_name,
+                            "tweet_id": "",
+                            "text": text_val,
+                            "impressions": "0",
+                            "likes": "0",
+                            "rts": "0",
+                            "replies": "0",
+                            "followers_before": "0",
+                            "followers_after": "0",
+                            "Pseudo": str(cand.get("pseudo", "")),
+                            "速報": "",
+                            "確定": "",
+                            "novelty": str(cand.get("novelty", "")),
+                            "safety": str(cand.get("safety", "")),
+                            "tail": str(cand.get("tail", "")),
+                            "abs_rating_before": f"{abs_rating:.2f}",
+                            "abs_rating_after": f"{abs_rating:.2f}",
+                            "rel_rating_before": f"{rel_rating:.2f}",
+                            "rel_rating_after": f"{rel_rating:.2f}",
+                        })
+                if to_append:
+                    try:
+                        append_rows(to_append)
+                        log_event("pinned", payload={"roles": list(approved.keys()), "count": len(to_append)}, meta={"today": today_str})
+                    except Exception as e:
+                        st.warning(f"DB追記でエラー（承認は画面に保持）: {e}")
+                st.success("承認保存しました（DBに記録済み）。②で実測入力へ。")
+                for k, v in approved.items():
+                    if v and isinstance(v, dict):
+                        text_val = v.get("text", "")
+                        flagged = v.get("flagged", False)
+                        flagged_reason = v.get("flagged_reason", "")
+                        st.markdown(f"**{k}**")
+                        if flagged:
+                            st.warning(f"⚠️ 警告: {flagged_reason}（人間承認が必要）")
+                        st.code(text_val if text_val else "(no text)", language=None)
+                    else:
+                        st.markdown(f"**{k}**")
+                        st.info("候補が選択されていません")
 
-# =========================================================
-# ② 実測入力（手入力最小/CSV可）
-# =========================================================
-with tab2:
-    st.subheader("実測入力：速報→確定（手入力最小）")
+    # =========================================================
+    # ② 実測入力（手入力最小/CSV可）
+    # =========================================================
+    with tab2:
+        st.subheader("実測入力：速報→確定（手入力最小）")
     approved = st.session_state.get("approved", {})
 
     # 投稿済みドラフトから選択（自動入力）
@@ -825,6 +892,7 @@ with tab2:
     })
 
     if st.button("保存（棋譜に追加）＋ 重み学習（擬似↔確定ズレ）＋ レート更新"):
+        track_event("confirm_click", {"tab": "tab2", "role": role_pick, "char_count": len(text.strip()), "has_metrics": int(impr) > 0})
 
         # 学習：擬似→確定のズレで重み更新
         y_true = float(s確定)
@@ -925,6 +993,7 @@ with tab2:
         map_role = st.selectbox("role列(任意)", ["(なし)"] + cols, index=0)
 
         if st.button("CSVを自動学習（擬似↔確定ズレで重み更新）"):
+            track_event("csv_learn_click", {"csv_rows": len(df)})
             learned = 0
             for _, r in df.iterrows():
                 txt = str(r[map_text]) if map_text != "(なし)" else ""
@@ -950,11 +1019,11 @@ with tab2:
             st.success(f"CSVから学習完了: {learned}件")
             st.info("次回生成から精度が上がります。")
 
-# =========================================================
-# ③ 分析・学習（重み/レート）
-# =========================================================
-with tab3:
-    st.subheader("レーティング & 学習状態")
+    # =========================================================
+    # ③ 分析・学習（重み/レート）
+    # =========================================================
+    with tab3:
+        st.subheader("レーティング & 学習状態")
     colA, colB, colC = st.columns(3)
     colA.metric("Abs Rating", f"{abs_rating:.1f}")
     colB.metric("Rel Rating", f"{rel_rating:.1f}")
@@ -965,6 +1034,7 @@ with tab3:
 
     # リプレイバッファで学習強化（失敗・低評価を優先サンプル）
     if rows and st.button("リプレイで学習強化（直近＋低評価優先で重み更新）"):
+        track_event("replay_train_click", {"total_rows": len(rows)})
         sampled = sample_for_learning(rows, k=50, recent_first=20)
         learned = 0
         for r in sampled:
@@ -985,6 +1055,7 @@ with tab3:
         if learned > 0:
             save_weights(W_PATH, w)
             st.success(f"リプレイ学習: {learned}件で重みを更新しました。")
+            track_event("replay_train_success", {"learned": learned})
         else:
             st.info("学習対象がありませんでした。")
 
@@ -1018,6 +1089,7 @@ with tab3:
                 key="delete_row_select",
             )
             if to_delete != "(選択しない)" and st.button("この行を取り消す（論理削除）"):
+                track_event("delete_row", {"tab": "tab3"})
                 try:
                     rid = int(to_delete.split("|")[0].replace("id=", "").strip())
                     if logical_delete_tweet(row_id=rid):
@@ -1040,6 +1112,7 @@ with tab3:
                 key="edit_row_select",
             )
             if to_edit != "(選択しない)":
+                track_event("edit_open", {"tab": "tab3"})
                 try:
                     rid = int(to_edit.split("|")[0].replace("id=", "").strip())
                     row_to_edit = next((r for r in recent_list if r.get("id") == rid), None)
@@ -1067,6 +1140,7 @@ with tab3:
                                 edit_fol_a = st.number_input("フォロワー（後）", min_value=0, value=_safe_int(row_to_edit.get("followers_after")), step=1, key="edit_fol_a")
                             edit_tweet_id = st.text_input("tweet_id（任意）", value=(row_to_edit.get("tweet_id") or ""), key="edit_tweet_id")
                             if st.form_submit_button("保存して反映"):
+                                track_event("edit_save", {"tab": "tab3"})
                                 if update_by_id is None:
                                     st.error("編集機能は利用できません。storage.update_by_id がインポートされていません。")
                                 else:
@@ -1092,11 +1166,11 @@ with tab3:
     else:
         st.warning("まだ棋譜がありません。②で1件入れると学習が始まります。")
 
-# =========================================================
-# ④ 自動化（安全ガード付き）
-# =========================================================
-with tab4:
-    st.subheader("自動化ダッシュボード（安全ガード付き）")
+    # =========================================================
+    # ④ 自動化（安全ガード付き）
+    # =========================================================
+    with tab4:
+        st.subheader("自動化ダッシュボード（安全ガード付き）")
 
     # --- 設定パネル ---
     auto_col1, auto_col2, auto_col3 = st.columns(3)
@@ -1121,6 +1195,7 @@ with tab4:
         save_trend = st.session_state.get("_auto_trend", trend_hint if "trend_hint" in dir() else "")
 
         if st.button("生成候補を全て下書きに保存", key="save_all_drafts"):
+            track_event("draft_save_all_click", {"tab": "tab4"})
             saved_count = 0
             for role_name in ["MAIN", "SUB", "EXP"]:
                 cands = pack.get(role_name, [])
@@ -1248,6 +1323,7 @@ with tab4:
 
                 with btn_col1:
                     if status == "draft" and st.button("承認", key=f"approve_{draft_id}"):
+                        track_event("draft_approve", {"tab": "tab4", "role": role})
                         try:
                             update_draft_status(draft_id, DRAFT_STATUS_APPROVED)
                             log_event("draft_approved", payload={"draft_id": draft_id})
@@ -1258,6 +1334,7 @@ with tab4:
 
                 with btn_col2:
                     if status in ("draft", "approved") and st.button("却下", key=f"reject_{draft_id}"):
+                        track_event("draft_reject", {"tab": "tab4", "role": role})
                         try:
                             update_draft_status(draft_id, DRAFT_STATUS_REJECTED)
                             log_event("draft_rejected", payload={"draft_id": draft_id})
@@ -1274,6 +1351,7 @@ with tab4:
                             placeholder="2025-01-15 09:00",
                         )
                         if st.button("予約", key=f"schedule_{draft_id}"):
+                            track_event("draft_schedule", {"tab": "tab4", "role": role})
                             if sched_time and len(sched_time) >= 10:
                                 try:
                                     update_draft_status(
@@ -1292,6 +1370,7 @@ with tab4:
                 with btn_col4:
                     if status in ("approved", "scheduled"):
                         if st.button("投稿", key=f"post_{draft_id}"):
+                            track_event("draft_post_click", {"tab": "tab4", "role": role, "auto_post": auto_post_enabled})
                             post_text = d.get("text", "")
                             # 安全チェック再実行
                             safety_recheck = compute_safety_score(post_text, d.get("topic", ""))
@@ -1358,6 +1437,7 @@ with tab4:
     # --- スケジュール処理（擬似スケジューラ） ---
     st.subheader("スケジュール処理")
     if st.button("予約済み下書きを今すぐ処理", key="process_scheduled"):
+        track_event("schedule_process_click", {"tab": "tab4"})
         try:
             scheduled = get_scheduled_drafts()
             if not scheduled:
@@ -1404,6 +1484,7 @@ with tab4:
     st.caption("安全スコア・品質スコアが閾値を超えた下書きのみ自動投稿候補にします。")
 
     if st.button("閾値超え候補を一括承認", key="auto_approve"):
+        track_event("auto_approve_click", {"safety_threshold": safety_threshold, "quality_threshold": quality_threshold})
         try:
             all_drafts = read_drafts(status=DRAFT_STATUS_DRAFT, limit=50)
             auto_approved = 0
@@ -1421,3 +1502,14 @@ with tab4:
                 st.info("閾値を超える候補がありませんでした。")
         except Exception as e:
             st.error(f"自動承認エラー: {e}")
+
+elif current_page == PAGE_ABOUT:
+    render_about_page()
+elif current_page == PAGE_PRIVACY:
+    render_privacy_page()
+elif current_page == PAGE_TERMS:
+    render_terms_page()
+elif current_page == PAGE_CONTACT:
+    render_contact_page()
+elif current_page == PAGE_BLOG:
+    render_blog_page()
